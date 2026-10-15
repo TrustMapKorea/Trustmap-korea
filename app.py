@@ -1,3 +1,4 @@
+
 import os
 import re
 import asyncio
@@ -25,7 +26,6 @@ CATEGORIES = [
     ["🔧 Услуги", "🤖 ИИ-помощник"],
 ]
 
-# Категории для поиска в Kakao.
 TERMS = {
     "кафе": "카페",
     "кофейня": "카페",
@@ -37,6 +37,7 @@ TERMS = {
     "клиника": "병원",
     "стоматолог": "치과",
     "стоматология": "치과",
+    "стоматологию": "치과",
     "аптека": "약국",
     "аптеки": "약국",
     "магазин": "매장",
@@ -61,7 +62,6 @@ TERMS = {
     "достопримечательности": "관광명소",
     "достопримечательность": "관광명소",
     "электроника": "전자제품",
-    "электроника магазин": "전자제품",
     "спортивный магазин": "스포츠용품",
     "спорттовары": "스포츠용품",
     "прачечная": "세탁소",
@@ -79,7 +79,6 @@ TERMS = {
     "спортзал": "헬스장",
 }
 
-# Варианты написания названий городов.
 CITIES = {
     "чхонан": "천안",
     "чонан": "천안",
@@ -107,46 +106,54 @@ CITIES = {
 
 STOPWORDS = {
     "в", "во", "на", "около", "возле", "рядом", "с", "по",
-    "найди", "найти", "покажи", "пожалуйста", "мне", "лучший",
-    "лучшая", "лучшие", "недорогой", "недорогая", "хороший",
-    "хорошая", "хорошие", "the", "in", "near", "find", "show",
+    "найди", "найти", "покажи", "пожалуйста", "мне",
+    "лучший", "лучшая", "лучшие", "недорогой", "недорогая",
+    "недорогие", "дешевый", "дешевая", "дешевые",
+    "the", "in", "near", "find", "show", "please",
 }
 
-PLACE_HINTS = {
-    "кафе", "кофейня", "ресторан", "еда", "больница", "клиника",
-    "стоматолог", "стоматология", "аптека", "магазин", "супермаркет",
-    "детские товары", "детский магазин", "косметика", "мебель",
-    "автосервис", "сто", "автозапчасти", "запчасти",
-    "парикмахерская", "салон красоты", "отель", "гостиница",
-    "ветеринар", "ветклиника", "зоомагазин", "достопримечательность",
-    "достопримечательности", "электроника", "спорттовары",
-    "прачечная", "уборка", "сантехник", "банк", "банкомат",
-    "почта", "детский сад", "школа", "парк", "музей", "бассейн",
-    "спортзал",
+PLACE_HINTS = set(TERMS.keys()) | {
+    "больницы", "стоматология", "стоматологию",
+    "аптеки", "магазины", "рестораны",
+    "кафе", "запчасти", "автосервис",
 }
 
-CATEGORY_DESCRIPTIONS = [
-    ("카페", "Кафе или кофейня"),
-    ("음식점", "Ресторан или заведение питания"),
-    ("병원", "Больница или медицинская клиника"),
-    ("치과", "Стоматологическая клиника"),
-    ("약국", "Аптека"),
-    ("마트", "Супермаркет"),
-    ("호텔", "Отель или гостиница"),
-    ("미용실", "Парикмахерская или салон красоты"),
-    ("동물병원", "Ветеринарная клиника"),
-    ("자동차", "Автомобильные услуги или товары"),
-    ("관광", "Туристическое место"),
-    ("가구", "Мебельный магазин"),
-    ("화장품", "Магазин косметики"),
-    ("유아용품", "Магазин детских товаров"),
-    ("전자제품", "Магазин электроники"),
-    ("스포츠용품", "Спортивные товары"),
-    ("세탁소", "Прачечная"),
-    ("공원", "Парк"),
-    ("박물관", "Музей"),
-    ("학교", "Школа"),
-]
+# Слова и выражения, указывающие на вопрос к ИИ,
+# а не на прямой поиск заведения.
+AI_STARTS = (
+    "как ", "почему ", "зачем ", "что ", "кто ",
+    "где находится ", "объясни ", "расскажи ",
+    "подскажи ", "помоги ", "переведи ",
+    "перевод ", "напиши ", "составь ",
+    "посоветуй ", "можешь ", "можно ли ",
+    "сколько стоит ", "чем отличается ",
+    "how ", "why ", "what ", "who ", "where ",
+    "explain ", "translate ", "help me ",
+    "tell me ", "can you ", "could you ",
+    "please explain ", "please translate ",
+)
+
+AI_PHRASES = (
+    "как вежливо",
+    "как попросить",
+    "как сказать",
+    "как написать",
+    "как спросить",
+    "что значит",
+    "что означает",
+    "переведи на корейский",
+    "переведи на русский",
+    "по-корейски сказать",
+    "по-русски объясни",
+    "помоги разобраться",
+    "объясни мне",
+    "как это работает",
+    "how to say",
+    "how do i",
+    "how can i",
+    "what does it mean",
+    "translate into korean",
+)
 
 def make_keyboard():
     return ReplyKeyboardMarkup(
@@ -160,10 +167,32 @@ def make_keyboard():
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
+def looks_like_ai_question(text):
+    q = text.lower().replace("ё", "е").strip()
+
+    if q.startswith("/ai"):
+        return True
+
+    if any(q.startswith(start) for start in AI_STARTS):
+        return True
+
+    if any(phrase in q for phrase in AI_PHRASES):
+        return True
+
+    # Вопросы с вопросительным знаком и пояснительными формулировками
+    if "?" in q and any(
+        word in q for word in (
+            "как", "почему", "что", "можно", "помоги",
+            "how", "why", "what", "can you",
+        )
+    ):
+        return True
+
+    return False
+
 def translate_query(text):
     query = text.lower().replace("ё", "е")
 
-    # Сначала заменяем многословные категории.
     for russian, korean in sorted(
         TERMS.items(), key=lambda item: len(item[0]), reverse=True
     ):
@@ -181,17 +210,19 @@ def translate_query(text):
         if word in STOPWORDS:
             continue
 
-        # Уже корейское слово оставляем без изменения.
         if re.search(r"[가-힣]", word):
             translated.append(word)
             continue
 
-        # Распознаём города с окончаниями и опечатками.
         city_word = word
-        for ending in ("ами", "ями", "ого", "ему", "ами", "ями",
-                       "ах", "ях", "ом", "ам", "ям", "а", "у",
-                       "е", "ы", "и"):
-            if city_word.endswith(ending) and len(city_word) > len(ending) + 2:
+        for ending in (
+            "ами", "ями", "ого", "ему", "ах", "ях",
+            "ом", "ам", "ям", "а", "у", "е", "ы", "и",
+        ):
+            if (
+                city_word.endswith(ending)
+                and len(city_word) > len(ending) + 2
+            ):
                 city_word = city_word[:-len(ending)]
                 break
 
@@ -211,7 +242,6 @@ def translate_query(text):
             translated.append(city_match)
             continue
 
-        # Исправляем распространённые опечатки в названиях услуг.
         term_match = None
         term_score = 0
 
@@ -231,14 +261,34 @@ def translate_query(text):
     return " ".join(translated).strip()
 
 def is_place_search(text):
-    lower = text.lower().replace("ё", "е")
-    if any(hint in lower for hint in PLACE_HINTS):
-        return True
-    if any(city in lower for city in CITIES):
-        return True
-    if re.search(r"[가-힣]", text):
-        return True
-    return False
+    q = text.lower().replace("ё", "е").strip()
+
+    # Вопросы об услугах сначала направляем ИИ.
+    if looks_like_ai_question(q):
+        return False
+
+    words = re.findall(r"[a-zа-яё가-힣]+", q)
+
+    has_place = any(
+        hint in q for hint in PLACE_HINTS
+    )
+
+    has_city = any(
+        similarity(word, city) >= 0.68
+        for word in words
+        for city in CITIES
+    )
+
+    # Поиск места должен содержать категорию заведения
+    # или явное название услуги.
+    return has_place or (
+        has_city and any(
+            word in q for word in (
+                "найди", "найти", "покажи", "поиск",
+                "find", "show", "search",
+            )
+        )
+    )
 
 async def search_kakao(query):
     if not KAKAO_KEY:
@@ -254,11 +304,11 @@ async def search_kakao(query):
             url, headers=headers, params=params
         ) as response:
             if response.status == 401:
-                return None, "Kakao не принял ключ API. Проверь настройки ключа."
+                return None, "Kakao не принял ключ API. Проверь его настройки."
             if response.status == 403:
                 return None, (
                     "Kakao отклонил запрос (HTTP 403). "
-                    "Нужно проверить доступ к Local API."
+                    "Проверь доступ к Local API."
                 )
             if response.status != 200:
                 return None, f"Ошибка поиска Kakao: HTTP {response.status}."
@@ -269,10 +319,8 @@ async def search_kakao(query):
 async def ask_ai(question):
     if not OPENAI_KEY:
         return (
-            "🤖 ИИ-помощник пока не подключён.\n\n"
-            "Нужно добавить OPENAI_API_KEY в Environment на Render. "
-            "Ключ создаётся в кабинете OpenAI API. "
-            "Использование API может быть платным."
+            "🤖 ИИ пока не подключён.\n"
+            "Проверь OPENAI_API_KEY в Environment на Render."
         )
 
     url = "https://api.openai.com/v1/responses"
@@ -283,18 +331,19 @@ async def ask_ai(question):
     payload = {
         "model": AI_MODEL,
         "instructions": (
-            "Ты — TrustMap Korea, полезный русскоязычный помощник по жизни "
-            "в Южной Корее. Отвечай ясно и дружелюбно. Помогай с переводом "
-            "русского на корейский и обратно, объясняй местные услуги, "
-            "покупки, повседневные вопросы и поиск мест. Не выдумывай "
-            "адреса, рейтинги, цены, часы работы или факты, которые не "
-            "проверены. Если вопрос требует актуальных данных, честно "
-            "предупреди, что их нужно проверить в надёжном источнике. "
-            "На медицинские, юридические и иммиграционные вопросы отвечай "
-            "осторожно и советуй официальные источники."
+            "Ты — ИИ-помощник TrustMap Korea. Отвечай на русском, "
+            "английском или корейском в зависимости от языка пользователя. "
+            "Помогай с жизнью в Южной Корее, переводами, покупками, "
+            "повседневными вопросами и поиском услуг. Исправляй очевидные "
+            "опечатки и старайся понять смысл сообщения. Если пользователь "
+            "просит найти реальные места, не выдумывай названия, адреса, "
+            "цены, рейтинги или часы работы. Объясняй, когда данные требуют "
+            "проверки. На медицинские, юридические и иммиграционные вопросы "
+            "отвечай осторожно и советуй проверять официальные источники. "
+            "Отвечай понятно, дружелюбно и по существу."
         ),
         "input": question,
-        "max_output_tokens": 600,
+        "max_output_tokens": 700,
         "store": False,
     }
 
@@ -306,21 +355,19 @@ async def ask_ai(question):
                 url, headers=headers, json=payload
             ) as response:
                 if response.status == 401:
+                    logging.error("OpenAI authentication failed")
                     return "ИИ не принял API-ключ. Проверь OPENAI_API_KEY в Render."
                 if response.status == 429:
                     return (
-                        "ИИ временно недоступен: достигнут лимит запросов "
-                        "или недостаточно средств на API-балансе."
+                        "ИИ временно недоступен: проверь лимиты и оплату "
+                        "OpenAI API."
                     )
                 if response.status != 200:
-                    logging.error(
-                        "OpenAI API error: HTTP %s", response.status
-                    )
+                    logging.error("OpenAI API error: HTTP %s", response.status)
                     return f"Ошибка ИИ-сервиса: HTTP {response.status}."
 
                 data = await response.json()
 
-        # Извлекаем текст ответа из Responses API.
         parts = []
         for item in data.get("output", []):
             if item.get("type") == "message":
@@ -342,9 +389,34 @@ def describe_category(place):
         place.get("category_name", "") + " " +
         place.get("category_group_name", "")
     )
-    for korean, russian in CATEGORY_DESCRIPTIONS:
+
+    descriptions = [
+        ("카페", "Кафе или кофейня"),
+        ("음식점", "Ресторан или заведение питания"),
+        ("병원", "Больница или медицинская клиника"),
+        ("치과", "Стоматологическая клиника"),
+        ("약국", "Аптека"),
+        ("마트", "Супермаркет"),
+        ("호텔", "Отель или гостиница"),
+        ("미용실", "Парикмахерская или салон красоты"),
+        ("동물병원", "Ветеринарная клиника"),
+        ("자동차", "Автомобильные услуги или товары"),
+        ("관광", "Туристическое место"),
+        ("가구", "Мебельный магазин"),
+        ("화장품", "Магазин косметики"),
+        ("유아용품", "Магазин детских товаров"),
+        ("전자제품", "Магазин электроники"),
+        ("스포츠용품", "Спортивные товары"),
+        ("세탁소", "Прачечная"),
+        ("공원", "Парк"),
+        ("박물관", "Музей"),
+        ("학교", "Школа"),
+    ]
+
+    for korean, russian in descriptions:
         if korean in category:
             return russian
+
     return "Категория: " + (category.strip() or "не указана")
 
 def format_results(original_query, korean_query, places):
@@ -352,13 +424,14 @@ def format_results(original_query, korean_query, places):
         return (
             f"По запросу «{original_query}» ничего не найдено.\n\n"
             f"Поисковый запрос: {korean_query}\n"
-            "Попробуй написать город и услугу отдельно или на корейском."
+            "Попробуй указать город и услугу, например: "
+            "«стоматология в Чхонане»."
         )
 
     lines = [
-        f"🔎 Результаты поиска\n"
+        "🔎 Результаты поиска\n"
         f"Твой запрос: {original_query}\n"
-        f"Поиск на корейском: {korean_query}\n"
+        f"Поиск на корейском: {korean_query}"
     ]
 
     for i, place in enumerate(places, start=1):
@@ -382,29 +455,33 @@ def format_results(original_query, korean_query, places):
         if link:
             item += f"🗺️ Карта и информация: {link}\n"
 
-        item += (
-            "⭐ Рейтинг: источник не предоставил подтверждённую оценку."
-        )
+        item += "⭐ Рейтинг: подтверждённая оценка не предоставлена."
         lines.append(item)
 
     lines.append(
-        "ℹ️ Данные получены через Kakao. "
-        "Проверь часы работы и актуальность информации перед посещением."
+        "ℹ️ Данные получены через Kakao. Проверь часы работы "
+        "и актуальность информации перед посещением."
     )
+
     return "\n\n".join(lines)
+
+async def send_long_message(message, text):
+    for start_index in range(0, len(text), 3500):
+        await message.answer(text[start_index:start_index + 3500])
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         "Добро пожаловать в TrustMap Korea! 🇰🇷\n\n"
-        "Я помогу искать места и услуги в Южной Корее, а также отвечать "
-        "на повседневные вопросы.\n\n"
-        "Примеры поиска:\n"
+        "Я помогу искать места и услуги в Южной Корее, переводить "
+        "фразы и отвечать на повседневные вопросы.\n\n"
+        "Примеры:\n"
         "• кафе в Чхонане\n"
-        "• стамотолог в Сеуле\n"
-        "• аптека в Пусане\n\n"
-        "Для обычных вопросов напиши сообщение или используй /ai.\n"
-        "Для поиска мест можно писать по-русски или по-корейски.",
+        "• стоматология в Сеуле\n"
+        "• аптека в Пусане\n"
+        "• Как вежливо попросить помощь по-корейски?\n\n"
+        "Для вопросов используй обычное сообщение или /ai.\n"
+        "Для поиска мест пиши название услуги и город.",
         reply_markup=make_keyboard(),
     )
 
@@ -412,37 +489,37 @@ async def start(message: Message):
 async def help_command(message: Message):
     await message.answer(
         "TrustMap Korea 🇰🇷\n\n"
-        "Поиск мест: «кафе в Чхонане», «аптека в Сеуле».\n"
-        "ИИ-помощник: /ai вопрос\n"
-        "Пример: /ai Как вежливо спросить дорогу по-корейски?\n\n"
-        "Можно писать с опечатками — бот постарается их распознать."
+        "🔎 Поиск мест: «кафе в Чхонане».\n"
+        "🤖 ИИ: /ai Как сказать спасибо по-корейски?\n\n"
+        "Можно задавать обычные вопросы и писать с опечатками."
     )
 
 @dp.message(Command("ai"))
 async def ai_command(message: Message):
     question = (message.text or "").partition(" ")[2].strip()
+
     if not question:
         await message.answer(
-            "🤖 Напиши вопрос после команды /ai.\n"
-            "Например: /ai Как сказать «где аптека?» по-корейски?"
+            "🤖 Напиши вопрос после /ai.\n"
+            "Например: /ai Как вежливо спросить дорогу по-корейски?"
         )
         return
 
     await message.answer("🤖 ИИ-помощник готовит ответ...")
-    answer = await ask_ai(question)
-    for start_index in range(0, len(answer), 3500):
-        await message.answer(answer[start_index:start_index + 3500])
+    await send_long_message(message, await ask_ai(question))
 
 @dp.message()
 async def handle_message(message: Message):
     text = (message.text or "").strip()
+
     if not text:
         return
 
     if text == "🤖 ИИ-помощник":
         await message.answer(
-            "🤖 Задай мне вопрос обычным сообщением или напиши:\n"
-            "/ai Как сказать «спасибо» по-корейски?"
+            "🤖 Напиши любой вопрос обычным сообщением.\n"
+            "Например: Как сказать «спасибо» по-корейски?\n"
+            "Также можно использовать /ai перед вопросом."
         )
         return
 
@@ -450,10 +527,16 @@ async def handle_message(message: Message):
         if text in row:
             await message.answer(
                 f"Раздел: {text}\n\n"
-                "Напиши конкретный запрос и город.\n"
-                "Например: стоматолог в Чхонане."
+                "Напиши конкретный вопрос или название места и город.\n"
+                "Например: стоматология в Чхонане."
             )
             return
+
+    # Сначала определяем намерение: вопрос или поиск заведения.
+    if looks_like_ai_question(text):
+        await message.answer("🤖 Передаю вопрос ИИ-помощнику...")
+        await send_long_message(message, await ask_ai(text))
+        return
 
     if is_place_search(text):
         korean_query = translate_query(text)
@@ -461,34 +544,41 @@ async def handle_message(message: Message):
 
         try:
             places, error = await search_kakao(korean_query)
+
             if error:
                 await message.answer(error)
                 return
 
             result = format_results(text, korean_query, places)
-            for start_index in range(0, len(result), 3500):
-                await message.answer(result[start_index:start_index + 3500])
+            await send_long_message(message, result)
+
         except asyncio.TimeoutError:
-            await message.answer("Поиск занял слишком много времени. Попробуй позже.")
+            await message.answer(
+                "Поиск занял слишком много времени. Попробуй позже."
+            )
         except aiohttp.ClientError:
             logging.exception("Kakao connection error")
-            await message.answer("Не удалось связаться с Kakao. Попробуй позже.")
+            await message.answer(
+                "Не удалось связаться с Kakao. Попробуй позже."
+            )
         except Exception:
             logging.exception("Unexpected search error")
-            await message.answer("Произошла ошибка поиска. Попробуй позже.")
+            await message.answer(
+                "Произошла ошибка поиска. Попробуй позже."
+            )
+
         return
 
-    # Обычные вопросы направляем ИИ-помощнику.
+    # Все остальные сообщения передаём ИИ.
     await message.answer("🤖 Передаю вопрос ИИ-помощнику...")
-    answer = await ask_ai(text)
-    for start_index in range(0, len(answer), 3500):
-        await message.answer(answer[start_index:start_index + 3500])
+    await send_long_message(message, await ask_ai(text))
 
 async def main():
     if not TOKEN:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
 
     bot = Bot(token=TOKEN)
+
     try:
         await dp.start_polling(bot)
     finally:
