@@ -424,19 +424,25 @@ def describe_category(place):
 
     return "Категория: " + (category.strip() or "не указана")
 
+
 def format_results(original_query, korean_query, places):
     if not places:
         return (
-            f"По запросу «{original_query}» ничего не найдено.\n\n"
-            f"Поисковый запрос: {korean_query}\n"
-            "Попробуй указать город и услугу, например: "
-            "«стоматология в Чхонане»."
+            "🇰🇷 TRUSTMAP KOREA\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔎 РЕЗУЛЬТАТЫ ПОИСКА\n\n"
+            f"😔 По запросу «{original_query}» ничего не найдено.\n\n"
+            f"🇰🇷 Поиск на корейском: {korean_query}\n\n"
+            "💡 Попробуй указать город и услугу.\n"
+            "Например: стоматология в Чхонане."
         )
 
     lines = [
-        "🔎 Результаты поиска\n"
-        f"Твой запрос: {original_query}\n"
-        f"Поиск на корейском: {korean_query}"
+        "🇰🇷 TRUSTMAP KOREA",
+        "━━━━━━━━━━━━━━━━━━",
+        "🔎 РЕЗУЛЬТАТЫ ПОИСКА",
+        f"💬 Твой запрос: {original_query}",
+        "━━━━━━━━━━━━━━━━━━",
     ]
 
     for i, place in enumerate(places, start=1):
@@ -451,24 +457,33 @@ def format_results(original_query, korean_query, places):
         description = describe_category(place)
 
         item = (
-            f"{i}. {name}\n"
-            f"📌 Что это: {description}\n"
-            f"📍 Адрес: {address}\n"
+            f"\n📍 МЕСТО № {i}\n"
+            f"🏢 {name}\n"
+            "──────────────────\n"
+            f"🏷️ Категория: {description}\n"
+            f"🗺️ Адрес: {address}\n"
             f"☎️ Телефон: {phone}\n"
         )
 
         if link:
-            item += f"🗺️ Карта и информация: {link}\n"
+            item += f"🔗 Карта и подробности: {link}\n"
 
-        item += "⭐ Рейтинг: подтверждённая оценка не предоставлена."
+        item += (
+            "⭐ Отзывы TrustMap: пока нет оценок "
+            "пользователей."
+        )
+
         lines.append(item)
 
     lines.append(
-        "ℹ️ Данные получены через Kakao. Проверь часы работы "
-        "и актуальность информации перед посещением."
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        "ℹ️ Источник данных: Kakao.\n"
+        "Перед посещением проверь адрес и часы работы.\n\n"
+        "💙 TrustMap Korea — находи нужное с уверенностью!"
     )
 
     return "\n\n".join(lines)
+
 
 async def send_long_message(message, text):
     for start_index in range(0, len(text), 3500):
