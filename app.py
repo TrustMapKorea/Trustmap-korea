@@ -489,7 +489,6 @@ async def send_long_message(message, text):
     for start_index in range(0, len(text), 3500):
         await message.answer(text[start_index:start_index + 3500])
 
-@dp.message(CommandStart())
 
 @dp.message(CommandStart())
 async def start(message: Message):
