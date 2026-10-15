@@ -559,8 +559,8 @@ async def handle_message(message: Message):
         return
 
     for row in CATEGORIES:
-       
-if text in row:
+    
+        if text in row:
             if text == "🔎 Поиск мест":
                 await message.answer(
                     "🔎 ПОИСК МЕСТ\n\n"
