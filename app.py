@@ -116,8 +116,35 @@ def make_keyboard():
         resize_keyboard=True,
     )
 
+
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
+
+
+AI_STARTS = (
+    "как ",
+    "почему ",
+    "что ",
+    "кто ",
+    "когда ",
+    "зачем ",
+    "можно ли ",
+    "помоги ",
+    "объясни ",
+    "переведи ",
+    "посоветуй ",
+    "сколько стоит ",
+    "где находится ",
+    "how ",
+    "why ",
+    "what ",
+    "who ",
+    "when ",
+    "help ",
+    "translate ",
+    "explain ",
+)
+
 
 def looks_like_ai_question(text):
     q = text.lower().replace("ё", "е").strip()
