@@ -212,12 +212,9 @@ def translate_query(text):
 
     return " ".join(translated).strip()
 
+
 def is_place_search(text):
     q = text.lower().replace("ё", "е").strip()
-
-    # Вопросы об услугах сначала направляем ИИ.
-    if looks_like_ai_question(q):
-        return False
 
     words = re.findall(r"[a-zа-яё가-힣]+", q)
 
@@ -225,22 +222,27 @@ def is_place_search(text):
         hint in q for hint in PLACE_HINTS
     )
 
+    # Сначала ищем заведения через Kakao.
+    if has_place:
+        return True
+
+    # Остальные вопросы передаём ИИ.
+    if looks_like_ai_question(q):
+        return False
+
     has_city = any(
         similarity(word, city) >= 0.68
         for word in words
         for city in CITIES
     )
 
-    # Поиск места должен содержать категорию заведения
-    # или явное название услуги.
-    return has_place or (
-        has_city and any(
-            word in q for word in (
-                "найди", "найти", "покажи", "поиск",
-                "find", "show", "search",
-            )
+    return has_city and any(
+        word in q for word in (
+            "найди", "найти", "покажи", "поиск",
+            "find", "show", "search",
         )
     )
+
 
 async def search_kakao(query):
     if not KAKAO_KEY:
