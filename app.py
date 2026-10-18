@@ -514,8 +514,9 @@ async def start_clothing_flow(message, user_id):
     )
 
 
-async def finish_clothing_flow(callback, user_id):
-    flow = USER_FLOWS.get(str(user_id), {})
+async def finish_clothing_flow(message, user_id, city_text):
+    user_id = str(user_id)
+    flow = USER_FLOWS.get(user_id, {})
     values = flow.get("values", {})
     audience = values.get("audience", "adult")
     gender = values.get("gender", "any")
@@ -523,24 +524,23 @@ async def finish_clothing_flow(callback, user_id):
     audience_ko = "아동복" if audience == "child" else "성인 의류"
     gender_ko = {"men": "남성", "women": "여성", "unisex": "유니섹스"}.get(gender, "")
     budget_ko = {"budget": "저렴한", "brand": "브랜드", "any": ""}.get(budget, "")
-    terms = " ".join(x for x in [budget_ko, gender_ko, audience_ko, "매장"] if x)
-    city = values.get("city")
-    if city:
-        terms += " " + city
-    USER_FLOWS.pop(str(user_id), None)
-    await callback.message.answer(f"🔎 Ищу реальные магазины: {terms}\nПодожди немного...")
+    city_ko = find_city(city_text) or city_text.strip()
+    terms = " ".join(x for x in [budget_ko, gender_ko, audience_ko, "매장", city_ko] if x)
+    USER_FLOWS.pop(user_id, None)
+
+    await message.answer(f"🔎 Ищу магазины одежды в городе «{city_text}». Подожди немного...")
     places, error = await search_kakao(terms)
     if error:
-        await callback.message.answer(error)
+        await message.answer(error, reply_markup=make_keyboard())
         return
     if not places:
-        await callback.message.answer(
-            f"😔 Магазины по запросу «{terms}» не найдены. "
-            "Попробуй выбрать другой город или написать город отдельным сообщением.",
+        await message.answer(
+            f"😔 Магазины по запросу «{terms}» не найдены. Попробуй другой город или другой тип одежды.",
             reply_markup=make_keyboard(),
         )
         return
-    LAST_PLACE_SEARCH[str(user_id)] = terms
+
+    LAST_PLACE_SEARCH[user_id] = terms
     for i, place in enumerate(places, 1):
         place_id = str(place.get("id", ""))
         summary = get_review_summary(place_id) if place_id else {}
@@ -557,10 +557,8 @@ async def finish_clothing_flow(callback, user_id):
             caption += "💙 TrustMap: пока нет оценок\n"
         if place.get("place_url"):
             caption += f"🗺️ {place['place_url']}"
-        await callback.message.answer(
-            caption, reply_markup=review_keyboard(place_id) if place_id else None
-        )
-    await callback.message.answer("Готово! Можешь выбрать другую категорию в меню.", reply_markup=make_keyboard())
+        await message.answer(caption, reply_markup=review_keyboard(place_id) if place_id else None)
+    await message.answer("Готово! Можешь выбрать другую категорию в меню.", reply_markup=make_keyboard())
 
 
 @dp.message(CommandStart())
@@ -626,9 +624,12 @@ async def clothing_callback(callback: CallbackQuery):
         await callback.message.edit_text("💳 Какой вариант предпочитаешь?", reply_markup=clothing_keyboard("budget"))
     elif stage == "budget":
         values["budget"] = value
+        flow["stage"] = "city"
         await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            "📍 В каком городе искать магазины одежды?\nНапиши город, например: Чхонан, Сеул или Пусан."
+        )
         await callback.answer("Выбор сохранён")
-        await finish_clothing_flow(callback, user_id)
         return
     await callback.answer()
 
@@ -703,52 +704,77 @@ async def handle_message(message: Message):
     text = (message.text or "").strip()
     if not text:
         return
+
     user_id = str(message.from_user.id)
     q = normalize(text)
+    is_menu_item = any(text in row for row in CATEGORIES)
+    active_flow = USER_FLOWS.get(user_id)
 
-    # Каждое новое текстовое сообщение — новый запрос.
-    # Не позволяем предыдущему поиску автоматически влиять на текущий.
+    # Продолжаем активный сценарий, если пользователь отвечает на вопрос о городе.
+    if active_flow and active_flow.get("stage") == "city" and not is_menu_item:
+        # Если вместо города прислали новый запрос, запускаем новый запрос отдельно.
+        if is_place_search(text) and not find_city(text):
+            USER_FLOWS.pop(user_id, None)
+        else:
+            if active_flow.get("kind") == "clothing":
+                await finish_clothing_flow(message, user_id, text)
+                return
+            if active_flow.get("kind") == "search":
+                original_query = active_flow.get("values", {}).get("query", "")
+                USER_FLOWS.pop(user_id, None)
+                await run_place_search(message, f"{original_query} в {text}", user_id)
+                return
+
+    # Не даём предыдущему поиску влиять на новое самостоятельное сообщение.
     LAST_PLACE_SEARCH.pop(user_id, None)
 
-    # Если пользователь написал новое сообщение во время сценария одежды,
-    # отменяем незавершённый сценарий. Кнопки одежды обрабатываются callback-ами.
-    USER_FLOWS.pop(user_id, None)
-
     if text == "🤖 ИИ-помощник":
-        await message.answer("🤖 Напиши вопрос обычным сообщением. Я буду учитывать контекст переписки.")
+        USER_FLOWS.pop(user_id, None)
+        await message.answer("🤖 Напиши любой вопрос обычным сообщением. Я отвечу на языке сообщения.")
         return
     if text == "🌐 Язык / Language":
+        USER_FLOWS.pop(user_id, None)
         await message.answer("🌐 Можно писать по-русски, по-английски или по-корейски. Я отвечу на языке сообщения.")
         return
 
     for row in CATEGORIES:
         if text in row:
+            USER_FLOWS.pop(user_id, None)
             if text == "🔎 Поиск мест":
-                await message.answer("🔎 Напиши, что ищешь и в каком городе. Например: кафе в Чхонане.")
+                await message.answer("🔎 Напиши, что ищешь. Если город не указан, я уточню его.")
             elif text == "🏥 Медицина":
-                await message.answer("🏥 Напиши, что нужно найти и в каком городе. Например: стоматология в Сеуле.")
+                await message.answer("🏥 Напиши, что нужно найти. Если город не указан, я уточню его.")
             elif text == "💰 Сравнение цен":
-                await message.answer("💰 Напиши товар или услугу, город и бюджет. Фактические цены нужно проверять у продавца.")
+                await message.answer("💰 Напиши товар или услугу и, по возможности, бюджет. Если город нужен для поиска, я уточню его.")
             elif text == "🛍️ Магазины":
-                await message.answer("🛍️ Что ищем? Например: «найди одежду» — появятся кнопки выбора.")
+                await message.answer("🛍️ Что ищем? Например: «одежду», «детские товары» или «косметику».")
             else:
                 await message.answer(
-                    f"{text}\n\nНапиши, что именно нужно найти и в каком городе. "
-                    "Для одежды доступны интерактивные кнопки выбора."
+                    f"{text}\n\nНапиши, что именно нужно найти. Если для поиска нужен город, я спрошу его отдельно."
                 )
             return
 
-    if any(word in q for word in ("одежду", "одежда", "магазин одежды", "clothes", "clothing")):
+    if any(word in q for word in ("одежду", "одежда", "магазин одежды", "женская одежда",
+                                  "мужская одежда", "детская одежда", "clothes", "clothing")):
+        USER_FLOWS.pop(user_id, None)
         await start_clothing_flow(message, user_id)
         return
 
-    # Не объединяем новое сообщение с LAST_PLACE_SEARCH:
-    # это и вызывало повторный запуск старого запроса.
-
     if is_place_search(text):
+        if not find_city(text):
+            USER_FLOWS[user_id] = {
+                "kind": "search",
+                "stage": "city",
+                "values": {"query": text},
+            }
+            await message.answer(
+                "📍 В каком городе искать?\nНапиши, например: Чхонан, Сеул или Пусан."
+            )
+            return
         await run_place_search(message, text, user_id)
         return
 
+    USER_FLOWS.pop(user_id, None)
     await message.answer("🤖 Передаю сообщение ИИ-помощнику...")
     await send_long_message(message, await ask_ai(text, message.from_user.id))
 
