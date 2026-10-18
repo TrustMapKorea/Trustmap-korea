@@ -484,23 +484,16 @@ async def run_place_search(message, query, user_id):
             f"🏷️ {describe_category(place)}\n"
             f"📍 {address}\n"
             f"☎️ {phone}\n"
-            f"🏅 Официальный рейтинг: {official}\n"
         )
         if overall:
             caption += f"💙 Оценка TrustMap: {overall[0]:.1f}/5 ({overall[1]} оценок)\n"
         else:
             caption += "💙 Оценка TrustMap: пока нет оценок\n"
-        for key in RATING_DIMENSIONS:
-            if key != "overall" and key in summary:
-                caption += f"• {RATING_DIMENSIONS[key]}: {summary[key][0]:.1f}/5 ({summary[key][1]})\n"
         if link:
             caption += f"\n🔗 Карта: {link}"
         keyboard = review_keyboard(place_id, place) if place_id else None
         await message.answer(caption, reply_markup=keyboard, disable_web_page_preview=False)
-    await message.answer(
-        "ℹ️ Данные о местах получены из Kakao. Фотографии и официальные рейтинги "
-        "этот метод API может не предоставлять. Оценки TrustMap — отдельные оценки наших пользователей."
-    )
+    await message.answer("💙 Оценки под карточками — личные отзывы пользователей TrustMap.")
 
 
 def clothing_keyboard(stage):
@@ -546,6 +539,139 @@ CITY_CALLBACKS = {
     "seongnam": "성남", "gwangju": "광주",
 }
 
+
+
+def housing_keyboard(stage):
+    options = {
+        "budget": [
+            ("💰 До 50만 ₩/мес.", "under50"),
+            ("💰 50–80만 ₩/мес.", "50to80"),
+            ("💰 80–120만 ₩/мес.", "80to120"),
+            ("💰 От 120만 ₩/мес.", "over120"),
+            ("✍️ Другое / свой бюджет", "other"),
+        ],
+        "type": [
+            ("🏢 Квартира (아파트)", "apartment"),
+            ("🏙️ Офистель (오피스텔)", "officetel"),
+            ("🏠 Вилла / студия (빌라/원룸)", "villa"),
+            ("🔎 Любой тип", "any"),
+            ("✍️ Другое", "other"),
+        ],
+        "rooms": [
+            ("🚪 Студия / 1 комната", "one"),
+            ("🚪🚪 2 комнаты", "two"),
+            ("🚪🚪🚪 3 и больше", "threeplus"),
+            ("🔎 Неважно", "any"),
+            ("✍️ Другое", "other"),
+        ],
+        "furnished": [
+            ("🛋️ С мебелью", "yes"),
+            ("🏚️ Без мебели", "no"),
+            ("🔎 Неважно", "any"),
+            ("✍️ Другое", "other"),
+        ],
+    }
+    choices = options.get(stage, [])
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"home:{stage}:{value}")]
+            for label, value in choices]
+    if stage != "city":
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="home:cancel:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def start_housing_flow(message, user_id):
+    user_id = str(user_id)
+    LAST_PLACE_SEARCH.pop(user_id, None)
+    CONVERSATION_HISTORY.pop(user_id, None)
+    USER_FLOWS[user_id] = {"kind": "housing", "stage": "budget", "values": {}}
+    await message.answer(
+        "🏠 Подберём варианты поиска жилья. Выбери максимальную месячную аренду:",
+        reply_markup=housing_keyboard("budget"),
+    )
+
+
+async def advance_housing_flow(message, user_id, stage, value):
+    """Save one housing choice and show the next simple button step."""
+    user_id = str(user_id)
+    flow = USER_FLOWS.get(user_id)
+    if not flow or flow.get("kind") != "housing":
+        await message.answer("Начни поиск жилья заново: напиши «аренда квартиры».")
+        return
+    values = flow.setdefault("values", {})
+    if stage == "budget":
+        values["budget"] = {
+            "under50": "월세 50만원 이하",
+            "50to80": "월세 50-80만원",
+            "80to120": "월세 80-120만원",
+            "over120": "월세 120만원 이상",
+        }.get(value, value)
+        flow["stage"] = "type"
+        await message.answer("🏠 Какой тип жилья нужен?", reply_markup=housing_keyboard("type"))
+    elif stage == "type":
+        values["type"] = {
+            "apartment": "아파트", "officetel": "오피스텔",
+            "villa": "빌라 원룸", "any": "부동산",
+        }.get(value, value)
+        flow["stage"] = "rooms"
+        await message.answer("🚪 Сколько комнат?", reply_markup=housing_keyboard("rooms"))
+    elif stage == "rooms":
+        values["rooms"] = {
+            "one": "원룸", "two": "방 2개", "threeplus": "방 3개 이상", "any": "",
+        }.get(value, value)
+        flow["stage"] = "furnished"
+        await message.answer("🛋️ Нужна мебель?", reply_markup=housing_keyboard("furnished"))
+    elif stage == "furnished":
+        values["furnished"] = {
+            "yes": "가구 있음", "no": "가구 없음", "any": "",
+        }.get(value, value)
+        flow["stage"] = "city"
+        await message.answer("📍 Выбери город, где ищем жильё:", reply_markup=city_keyboard())
+
+
+async def finish_housing_flow(message, user_id, city_label, city_ko):
+    user_id = str(user_id)
+    flow = USER_FLOWS.get(user_id, {})
+    values = flow.get("values", {})
+    budget = values.get("budget", "")
+    housing_type = values.get("type", "부동산")
+    rooms = values.get("rooms", "")
+    furnished = values.get("furnished", "")
+    USER_FLOWS.pop(user_id, None)
+    # Kakao Local finds real-estate offices/places, not verified live rental listings.
+    query_parts = ["부동산", city_ko]
+    if housing_type and housing_type != "부동산":
+        query_parts.append(housing_type)
+    query = " ".join(query_parts)
+    await message.answer(
+        f"🔎 Ищу агентства недвижимости в городе {city_label} по выбранным параметрам…\n"
+        f"💰 Бюджет: {budget or 'не указан'}\n"
+        f"🏠 Тип: {housing_type or 'любой'}\n"
+        f"🚪 Комнаты: {rooms or 'неважно'}\n"
+        f"🛋️ Мебель: {furnished or 'неважно'}\n\n"
+        "ℹ️ Kakao Local показывает агентства и места, а не подтверждённые актуальные объявления аренды.",
+    )
+    places, error = await search_kakao(query)
+    if error:
+        await message.answer(error, reply_markup=make_keyboard())
+        return
+    if not places:
+        await message.answer(
+            f"😔 Агентства недвижимости по запросу в {city_label} не найдены. Попробуй другой город или тип жилья.",
+            reply_markup=make_keyboard(),
+        )
+        return
+    for i, place in enumerate(places, 1):
+        place_id = str(place.get("id", ""))
+        caption = (
+            f"🏠 АГЕНТСТВО №{i}\n\n"
+            f"🏢 {place.get('place_name', 'Название не указано')}\n"
+            f"📍 {place.get('road_address_name') or place.get('address_name') or 'Адрес не указан'}\n"
+            f"☎️ {place.get('phone') or 'Не указан'}"
+        )
+        if place.get("place_url"):
+            caption += f"\n🗺️ Карта: {place['place_url']}"
+        await message.answer(caption, reply_markup=review_keyboard(place_id, place) if place_id else None)
+    await message.answer("💙 Оценки под карточками — личные отзывы пользователей TrustMap.", reply_markup=make_keyboard())
 
 
 async def start_clothing_flow(message, user_id):
@@ -714,6 +840,39 @@ async def clothing_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("home:"))
+async def housing_callback(callback: CallbackQuery):
+    user_id = str(callback.from_user.id)
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Не удалось прочитать выбор.", show_alert=True)
+        return
+    _, stage, value = parts
+    flow = USER_FLOWS.get(user_id)
+    if value == "cancel":
+        USER_FLOWS.pop(user_id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск отменён")
+        return
+    if not flow or flow.get("kind") != "housing" or flow.get("stage") != stage:
+        await callback.answer("Этот шаг уже завершён. Начни поиск жилья заново.", show_alert=True)
+        return
+    if value == "other":
+        flow["awaiting_custom"] = stage
+        prompts = {
+            "budget": "✍️ Напиши свой бюджет в месяц, например: 70만원 или 700000 вон.",
+            "type": "✍️ Напиши нужный тип жилья своими словами.",
+            "rooms": "✍️ Напиши количество комнат или пожелание.",
+            "furnished": "✍️ Напиши пожелание по мебели.",
+        }
+        await callback.message.answer(prompts.get(stage, "✍️ Напиши свой вариант."))
+        await callback.answer()
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Выбор сохранён")
+    await advance_housing_flow(callback.message, user_id, stage, value)
+
+
 @dp.callback_query(F.data.startswith("city:"))
 async def city_callback(callback: CallbackQuery):
     user_id = str(callback.from_user.id)
@@ -752,6 +911,10 @@ async def city_callback(callback: CallbackQuery):
 
     if flow.get("kind") == "clothing":
         await finish_clothing_flow(callback.message, user_id, city_label)
+        return
+
+    if flow.get("kind") == "housing":
+        await finish_housing_flow(callback.message, user_id, city_label, city_ko)
         return
 
     if flow.get("kind") == "search":
@@ -819,20 +982,11 @@ async def score_callback(callback: CallbackQuery):
                 (place_id, place_name, str(callback.from_user.id), dimension, score),
             )
             conn.commit()
-        summary = get_review_summary(place_id)
-        average, count = summary.get(dimension, (float(score), 1))
         await callback.message.edit_reply_markup(reply_markup=None)
-        summary_lines = []
-        for key, (avg, votes) in summary.items():
-            label = RATING_DIMENSIONS.get(key, key)
-            summary_lines.append(f"• {label}: {avg:.1f}/5 ({votes})")
         await callback.message.answer(
-            f"💙 Спасибо за оценку!\n{RATING_DIMENSIONS[dimension]}: {score}/5\n"
-            f"Средняя оценка TrustMap по этому показателю: {average:.1f}/5 ({count} оценок).\n\n"
-            + "\n".join(summary_lines) +
-            "\n\nЭто собственный рейтинг пользователей TrustMap, а не официальный рейтинг заведения."
+            "💙 Спасибо! Это личная оценка пользователя TrustMap, а не официальный отзыв заведения."
         )
-        await callback.answer("Оценка сохранена")
+        await callback.answer("Спасибо за отзыв!")
     except sqlite3.Error:
         logging.exception("Could not save review")
         await callback.answer("Не удалось сохранить оценку. Попробуй позже.", show_alert=True)
@@ -848,6 +1002,12 @@ async def handle_message(message: Message):
     q = normalize(text)
     is_menu_item = any(text in row for row in CATEGORIES)
     active_flow = USER_FLOWS.get(user_id)
+
+    # При выборе «Другое» принимаем свободный ответ и продолжаем текущий сценарий.
+    if active_flow and active_flow.get("kind") == "housing" and active_flow.get("awaiting_custom") and not is_menu_item:
+        custom_stage = active_flow.pop("awaiting_custom")
+        await advance_housing_flow(message, user_id, custom_stage, text)
+        return
 
     # Продолжаем активный сценарий, если пользователь отвечает на вопрос о городе.
     if active_flow and active_flow.get("stage") == "city" and not is_menu_item:
@@ -866,6 +1026,9 @@ async def handle_message(message: Message):
                 return
             if active_flow.get("kind") == "clothing":
                 await finish_clothing_flow(message, user_id, text)
+                return
+            if active_flow.get("kind") == "housing":
+                await finish_housing_flow(message, user_id, text, city_ko)
                 return
             if active_flow.get("kind") == "search":
                 original_query = active_flow.get("values", {}).get("query", "")
@@ -896,11 +1059,21 @@ async def handle_message(message: Message):
                 await message.answer("💰 Напиши товар или услугу и, по возможности, бюджет. Если город нужен для поиска, я уточню его.")
             elif text == "🛍️ Магазины":
                 await message.answer("🛍️ Что ищем? Например: «одежду», «детские товары» или «косметику».")
+            elif text == "🏠 Недвижимость":
+                await start_housing_flow(message, user_id)
             else:
                 await message.answer(
                     f"{text}\n\nНапиши, что именно нужно найти. Если для поиска нужен город, я спрошу его отдельно."
                 )
             return
+
+    if any(word in q for word in (
+        "аренда квартиры", "аренду квартиры", "снять квартиру", "снять жилье", "снять жильё",
+        "аренда жилья", "квартира в аренду", "жилье в аренду", "жильё в аренду",
+        "аренда дома", "снять дом", "monthly rent", "rent an apartment", "apartment for rent",
+    )) or text == "🏠 Недвижимость":
+        await start_housing_flow(message, user_id)
+        return
 
     if any(word in q for word in ("одежду", "одежда", "магазин одежды", "женская одежда",
                                   "мужская одежда", "детская одежда", "clothes", "clothing")):
