@@ -494,8 +494,20 @@ def clothing_keyboard(stage):
     ])
 
 
+
 async def start_clothing_flow(message, user_id):
-    USER_FLOWS[str(user_id)] = {"kind": "clothing", "stage": "audience", "values": {}}
+    user_id = str(user_id)
+
+    # Удаляем старый запрос, чтобы он не вмешивался в выбор одежды.
+    LAST_PLACE_SEARCH.pop(user_id, None)
+
+    # Сохраняем новый сценарий выбора одежды.
+    USER_FLOWS[user_id] = {
+        "kind": "clothing",
+        "stage": "audience",
+        "values": {},
+    }
+
     await message.answer(
         "👕 Подберём магазины одежды!\n\nДля кого ищем?",
         reply_markup=clothing_keyboard("audience"),
@@ -694,6 +706,14 @@ async def handle_message(message: Message):
     user_id = str(message.from_user.id)
     q = normalize(text)
 
+    # Каждое новое текстовое сообщение — новый запрос.
+    # Не позволяем предыдущему поиску автоматически влиять на текущий.
+    LAST_PLACE_SEARCH.pop(user_id, None)
+
+    # Если пользователь написал новое сообщение во время сценария одежды,
+    # отменяем незавершённый сценарий. Кнопки одежды обрабатываются callback-ами.
+    USER_FLOWS.pop(user_id, None)
+
     if text == "🤖 ИИ-помощник":
         await message.answer("🤖 Напиши вопрос обычным сообщением. Я буду учитывать контекст переписки.")
         return
@@ -722,16 +742,8 @@ async def handle_message(message: Message):
         await start_clothing_flow(message, user_id)
         return
 
-    previous_search = LAST_PLACE_SEARCH.get(user_id)
-    if previous_search and (q in FOLLOWUP_ONLY or (find_city(q) and len(q.split()) <= 3)):
-        city = find_city(q)
-        if city:
-            city_name = next((name for name, korean in CITIES.items() if korean == city), q)
-            combined = f"{previous_search} {city_name}"
-        else:
-            combined = f"{previous_search} {text}"
-        await run_place_search(message, combined, user_id)
-        return
+    # Не объединяем новое сообщение с LAST_PLACE_SEARCH:
+    # это и вызывало повторный запуск старого запроса.
 
     if is_place_search(text):
         await run_place_search(message, text, user_id)
