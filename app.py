@@ -129,10 +129,15 @@ FOLLOWUP_ONLY = {
 
 RATING_DIMENSIONS = {
     "overall": "Общая оценка",
-    "food": "Еда / качество",
-    "service": "Обслуживание",
-    "value": "Цена и качество",
-    "atmosphere": "Атмосфера",
+    "quality": "Качество товара / услуги",
+    "food": "Вкус еды",
+    "speed": "Скорость обслуживания / выполнения",
+    "waiting": "Время ожидания",
+    "service": "Обслуживание и вежливость",
+    "value": "Цена / качество",
+    "atmosphere": "Атмосфера и комфорт",
+    "cleanliness": "Чистота",
+    "communication": "Общение и объяснения",
 }
 
 
@@ -352,13 +357,37 @@ def get_review_summary(place_id):
     return {row[0]: (float(row[1]), int(row[2])) for row in rows}
 
 
-def review_keyboard(place_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Оценить место", callback_data=f"rate:{place_id}:menu")],
-    ])
+def rating_dimensions_for_place(place):
+    """Return rating dimensions relevant to the kind of place."""
+    category = normalize(" ".join([
+        str(place.get("category_name", "")),
+        str(place.get("place_name", "")),
+    ]))
+    food_words = ("카페", "음식점", "식당", "restaurant", "cafe", "кафе", "ресторан")
+    medical_words = ("병원", "의원", "치과", "약국", "clinic", "hospital", "doctor", "медицин", "больниц", "клиник", "аптек")
+    if any(word in category for word in food_words):
+        keys = ("overall", "food", "speed", "service", "value", "atmosphere", "cleanliness")
+    elif any(word in category for word in medical_words):
+        keys = ("overall", "quality", "waiting", "service", "communication", "cleanliness", "value")
+    else:
+        keys = ("overall", "quality", "speed", "service", "value")
+    return [(key, RATING_DIMENSIONS[key]) for key in keys]
+
+
+def review_keyboard(place_id, place=None):
+    dimensions = rating_dimensions_for_place(place or {})
+    rows = []
+    for i in range(0, len(dimensions), 2):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"⭐ {label}", callback_data=f"rate:{place_id}:{key}"
+            ) for key, label in dimensions[i:i + 2]
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def rating_dimensions_keyboard(place_id):
+    # Compatibility fallback for older inline buttons.
     rows = []
     for key, label in RATING_DIMENSIONS.items():
         rows.append([InlineKeyboardButton(
@@ -409,8 +438,8 @@ def format_results(original_query, korean_query, places):
             item += f"💙 TrustMap: {overall[0]:.1f}/5 ({overall[1]} оценок)\n"
         else:
             item += "💙 TrustMap: пока нет оценок пользователей.\n"
-        for key in ("food", "service", "value", "atmosphere"):
-            if key in summary:
+        for key in RATING_DIMENSIONS:
+            if key != "overall" and key in summary:
                 item += f"  • {RATING_DIMENSIONS[key]}: {summary[key][0]:.1f}/5 ({summary[key][1]})\n"
         lines.append(item.rstrip())
     lines.append(
@@ -461,12 +490,12 @@ async def run_place_search(message, query, user_id):
             caption += f"💙 Оценка TrustMap: {overall[0]:.1f}/5 ({overall[1]} оценок)\n"
         else:
             caption += "💙 Оценка TrustMap: пока нет оценок\n"
-        for key in ("food", "service", "value", "atmosphere"):
-            if key in summary:
+        for key in RATING_DIMENSIONS:
+            if key != "overall" and key in summary:
                 caption += f"• {RATING_DIMENSIONS[key]}: {summary[key][0]:.1f}/5 ({summary[key][1]})\n"
         if link:
             caption += f"\n🔗 Карта: {link}"
-        keyboard = review_keyboard(place_id) if place_id else None
+        keyboard = review_keyboard(place_id, place) if place_id else None
         await message.answer(caption, reply_markup=keyboard, disable_web_page_preview=False)
     await message.answer(
         "ℹ️ Данные о местах получены из Kakao. Фотографии и официальные рейтинги "
@@ -495,6 +524,30 @@ def clothing_keyboard(stage):
 
 
 
+def city_keyboard():
+    """Inline city choices so users can select a city without typing it."""
+    cities = [
+        ("📍 Чхонан", "cheonan"), ("🏙️ Сеул", "seoul"),
+        ("🌊 Пусан", "busan"), ("✈️ Инчхон", "incheon"),
+        ("🌆 Тэгу", "daegu"), ("🏙️ Тэджон", "daejeon"),
+        ("🏘️ Сувон", "suwon"), ("📍 Пхёнтхэк", "pyeongtaek"),
+        ("🏙️ Соннам", "seongnam"), ("📍 Кванджу", "gwangju"),
+    ]
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"city:{key}")
+             for label, key in cities[i:i + 2]] for i in range(0, len(cities), 2)]
+    rows.append([InlineKeyboardButton(text="✍️ Ввести другой город", callback_data="city:other")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+CITY_CALLBACKS = {
+    "cheonan": "천안", "seoul": "서울", "busan": "부산", "incheon": "인천",
+    "daegu": "대구", "daejeon": "대전", "suwon": "수원", "pyeongtaek": "평택",
+    "seongnam": "성남", "gwangju": "광주",
+}
+
+
+
 async def start_clothing_flow(message, user_id):
     user_id = str(user_id)
 
@@ -519,28 +572,54 @@ async def finish_clothing_flow(message, user_id, city_text):
     flow = USER_FLOWS.get(user_id, {})
     values = flow.get("values", {})
     audience = values.get("audience", "adult")
-    gender = values.get("gender", "any")
+    gender = values.get("gender", "unisex")
     budget = values.get("budget", "any")
-    audience_ko = "아동복" if audience == "child" else "성인 의류"
-    gender_ko = {"men": "남성", "women": "여성", "unisex": "유니섹스"}.get(gender, "")
-    budget_ko = {"budget": "저렴한", "brand": "브랜드", "any": ""}.get(budget, "")
     city_ko = find_city(city_text) or city_text.strip()
-    terms = " ".join(x for x in [budget_ko, gender_ko, audience_ko, "매장", city_ko] if x)
-    USER_FLOWS.pop(user_id, None)
 
-    await message.answer(f"🔎 Ищу магазины одежды в городе «{city_text}». Подожди немного...")
-    places, error = await search_kakao(terms)
-    if error:
-        await message.answer(error, reply_markup=make_keyboard())
-        return
+    # Kakao keyword search is sensitive to overly specific queries. Try several
+    # natural Korean variants instead of a single long phrase.
+    if audience == "child":
+        base_terms = ["아동복", "아동복 매장", "유아동 의류", "어린이 옷가게", "아동 의류 매장"]
+    elif gender == "men":
+        base_terms = ["남성 의류", "남성복 매장", "남자 옷가게", "의류 매장", "옷가게"]
+    elif gender == "women":
+        base_terms = ["여성 의류", "여성복 매장", "여자 옷가게", "의류 매장", "옷가게"]
+    else:
+        base_terms = ["의류 매장", "옷가게", "의류 쇼핑", "쇼핑몰"]
+
+    # Keep the budget preference as a secondary query, not as a required keyword.
+    if budget == "budget":
+        base_terms = ["저렴한 " + term for term in base_terms] + base_terms
+    elif budget == "brand":
+        base_terms = ["브랜드 " + term for term in base_terms] + base_terms
+    queries = []
+    for term in base_terms:
+        query = f"{term} {city_ko}".strip()
+        if query not in queries:
+            queries.append(query)
+
+    USER_FLOWS.pop(user_id, None)
+    await message.answer(f"🔎 Ищу магазины одежды в городе «{city_text}». Проверю несколько вариантов поиска...")
+    places = []
+    used_query = queries[0]
+    for query in queries:
+        found, error = await search_kakao(query)
+        if error:
+            await message.answer(error, reply_markup=make_keyboard())
+            return
+        if found:
+            places, used_query = found, query
+            break
+
     if not places:
         await message.answer(
-            f"😔 Магазины по запросу «{terms}» не найдены. Попробуй другой город или другой тип одежды.",
+            f"😔 Kakao не нашёл подходящие магазины одежды в городе «{city_text}» по нескольким вариантам запроса. "
+            "Попробуй другой город или выбери «Любая» категория одежды.",
             reply_markup=make_keyboard(),
         )
         return
 
-    LAST_PLACE_SEARCH[user_id] = terms
+    LAST_PLACE_SEARCH[user_id] = used_query
     for i, place in enumerate(places, 1):
         place_id = str(place.get("id", ""))
         summary = get_review_summary(place_id) if place_id else {}
@@ -557,7 +636,7 @@ async def finish_clothing_flow(message, user_id, city_text):
             caption += "💙 TrustMap: пока нет оценок\n"
         if place.get("place_url"):
             caption += f"🗺️ {place['place_url']}"
-        await message.answer(caption, reply_markup=review_keyboard(place_id) if place_id else None)
+        await message.answer(caption, reply_markup=review_keyboard(place_id, place) if place_id else None)
     await message.answer("Готово! Можешь выбрать другую категорию в меню.", reply_markup=make_keyboard())
 
 
@@ -627,11 +706,62 @@ async def clothing_callback(callback: CallbackQuery):
         flow["stage"] = "city"
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
-            "📍 В каком городе искать магазины одежды?\nНапиши город, например: Чхонан, Сеул или Пусан."
+            "📍 Выбери город для поиска магазинов одежды:",
+            reply_markup=city_keyboard(),
         )
         await callback.answer("Выбор сохранён")
         return
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("city:"))
+async def city_callback(callback: CallbackQuery):
+    user_id = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
+    flow = USER_FLOWS.get(user_id)
+
+    if choice == "cancel":
+        USER_FLOWS.pop(user_id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск отменён")
+        return
+
+    if choice == "other":
+        if flow and flow.get("stage") == "city":
+            flow["allow_custom_city"] = True
+        await callback.message.answer("✍️ Напиши название города сообщением.")
+        await callback.answer()
+        return
+
+    city_ko = CITY_CALLBACKS.get(choice)
+    if not city_ko:
+        await callback.answer("Не удалось определить город. Попробуй ещё раз.", show_alert=True)
+        return
+
+    city_label = {
+        "cheonan": "Чхонан", "seoul": "Сеул", "busan": "Пусан", "incheon": "Инчхон",
+        "daegu": "Тэгу", "daejeon": "Тэджон", "suwon": "Сувон", "pyeongtaek": "Пхёнтхэк",
+        "seongnam": "Соннам", "gwangju": "Кванджу",
+    }[choice]
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer(f"Выбран город: {city_label}")
+
+    if not flow or flow.get("stage") != "city":
+        await callback.message.answer("Выбор города уже не связан с активным запросом. Напиши запрос заново.", reply_markup=make_keyboard())
+        return
+
+    if flow.get("kind") == "clothing":
+        await finish_clothing_flow(callback.message, user_id, city_label)
+        return
+
+    if flow.get("kind") == "search":
+        original_query = flow.get("values", {}).get("query", "")
+        USER_FLOWS.pop(user_id, None)
+        await run_place_search(callback.message, f"{original_query} {city_ko}", user_id)
+        return
+
+    USER_FLOWS.pop(user_id, None)
+    await callback.message.answer("Не удалось продолжить поиск. Попробуй начать его заново.", reply_markup=make_keyboard())
 
 
 @dp.callback_query(F.data.startswith("rate:"))
@@ -647,14 +777,18 @@ async def rating_callback(callback: CallbackQuery):
         return
     if dimension == "menu":
         await callback.message.answer(
-            "💙 Какую сторону места хочешь оценить?",
+            "💙 Выбери показатель и поставь ему оценку:",
             reply_markup=rating_dimensions_keyboard(place_id),
         )
     elif dimension in RATING_DIMENSIONS:
         await callback.message.answer(
-            f"Поставь оценку: {RATING_DIMENSIONS[dimension]}",
+            f"💙 Оцени: {RATING_DIMENSIONS[dimension]}\n\n"
+            "1 ⭐ — очень плохо · 2 ⭐ — плохо · 3 ⭐ — нормально · 4 ⭐ — хорошо · 5 ⭐ — отлично",
             reply_markup=score_keyboard(place_id, dimension),
         )
+    else:
+        await callback.answer("Этот показатель больше недоступен. Обнови поиск мест.", show_alert=True)
+        return
     await callback.answer()
 
 
@@ -688,10 +822,15 @@ async def score_callback(callback: CallbackQuery):
         summary = get_review_summary(place_id)
         average, count = summary.get(dimension, (float(score), 1))
         await callback.message.edit_reply_markup(reply_markup=None)
+        summary_lines = []
+        for key, (avg, votes) in summary.items():
+            label = RATING_DIMENSIONS.get(key, key)
+            summary_lines.append(f"• {label}: {avg:.1f}/5 ({votes})")
         await callback.message.answer(
             f"💙 Спасибо за оценку!\n{RATING_DIMENSIONS[dimension]}: {score}/5\n"
-            f"Средняя оценка TrustMap по этой категории: {average:.1f}/5 ({count} оценок).\n\n"
-            "Это рейтинг пользователей TrustMap, не официальный рейтинг заведения."
+            f"Средняя оценка TrustMap по этому показателю: {average:.1f}/5 ({count} оценок).\n\n"
+            + "\n".join(summary_lines) +
+            "\n\nЭто собственный рейтинг пользователей TrustMap, а не официальный рейтинг заведения."
         )
         await callback.answer("Оценка сохранена")
     except sqlite3.Error:
@@ -716,13 +855,22 @@ async def handle_message(message: Message):
         if is_place_search(text) and not find_city(text):
             USER_FLOWS.pop(user_id, None)
         else:
+            city_ko = find_city(text)
+            if not city_ko and active_flow.get("allow_custom_city"):
+                city_ko = text.strip()
+            if not city_ko:
+                await message.answer(
+                    "Не распознал город. Выбери его кнопкой ниже или введи, например, Чхонан, Сеул или Пусан.",
+                    reply_markup=city_keyboard(),
+                )
+                return
             if active_flow.get("kind") == "clothing":
                 await finish_clothing_flow(message, user_id, text)
                 return
             if active_flow.get("kind") == "search":
                 original_query = active_flow.get("values", {}).get("query", "")
                 USER_FLOWS.pop(user_id, None)
-                await run_place_search(message, f"{original_query} в {text}", user_id)
+                await run_place_search(message, f"{original_query} {city_ko}", user_id)
                 return
 
     # Не даём предыдущему поиску влиять на новое самостоятельное сообщение.
@@ -768,7 +916,8 @@ async def handle_message(message: Message):
                 "values": {"query": text},
             }
             await message.answer(
-                "📍 В каком городе искать?\nНапиши, например: Чхонан, Сеул или Пусан."
+                "📍 Выбери город для поиска. Если твоего города нет в списке, нажми «Ввести другой город».",
+                reply_markup=city_keyboard(),
             )
             return
         await run_place_search(message, text, user_id)
