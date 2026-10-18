@@ -3,11 +3,13 @@ import re
 import asyncio
 import logging
 import sqlite3
+import json
 from difflib import SequenceMatcher
 from contextlib import closing
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
@@ -37,7 +39,9 @@ CATEGORIES = [
     ["👶 Товары для детей", "🐾 Товары для животных"],
     ["🔧 Бытовые услуги", "🏨 Отели"],
     ["📍 Достопримечательности", "💰 Сравнение цен"],
+    ["🧖 Бани и сауны", "🎮 Компьютерные клубы"],
     ["🤖 ИИ-помощник", "🌐 Язык / Language"],
+    ["🧹 Очистить чат"],
 ]
 
 TERMS = {
@@ -50,6 +54,11 @@ TERMS = {
     "лаунж": "라운지", "лаунж-бар": "라운지바", "закусочная": "분식집",
     "закусочные": "분식집", "компьютерный клуб": "PC방",
     "компьютерные клубы": "PC방", "компьютерный клубы": "PC방",
+    "компьютерный клуб": "PC방", "компьютерных клубов": "PC방", "пк клуб": "PC방",
+    "баня": "찜질방", "бани": "찜질방", "баню": "찜질방", "бань": "찜질방",
+    "сауна": "사우나", "сауны": "사우나", "сауну": "사우나",
+    "спа": "스파", "джимджильбан": "찜질방", "ччимчильбан": "찜질방",
+    "общественная баня": "목욕탕", "общественные бани": "목욕탕",
     "больница": "병원", "больницы": "병원", "клиника": "병원",
     "стоматолог": "치과", "стоматология": "치과", "стоматологию": "치과",
     "аптека": "약국", "аптеки": "약국", "магазин": "매장", "магазины": "매장",
@@ -107,6 +116,8 @@ PLACE_HINTS = set(TERMS.keys()) | {
     "прокат машин", "аренда автомобиля", "аренду машины", "аренду авто",
     "недвижимость", "снять квартиру", "аренда квартиры", "аренда квартир",
     "аренда помещений", "работа", "одежда", "компьютерные клубы",
+    "компьютерный клуб", "пк клуб", "баня", "бани", "сауна", "сауны",
+    "джимджильбан", "ччимчильбан", "общественная баня", "спа",
 }
 
 AI_STARTS = (
@@ -155,7 +166,155 @@ def init_db():
                 UNIQUE(place_id, user_id, dimension)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS search_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                korean_query TEXT NOT NULL,
+                results_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, message_id)
+            )
+        """)
         conn.commit()
+
+
+def save_search_memory(user_id, query, korean_query, places):
+    """Persist recent searches and real place links; this survives chat clearing."""
+    compact_places = []
+    for place in (places or [])[:15]:
+        compact_places.append({
+            "name": place.get("place_name", "Название не указано"),
+            "address": place.get("road_address_name") or place.get("address_name") or "Адрес не указан",
+            "phone": place.get("phone") or "",
+            "url": place.get("place_url") or "",
+            "id": str(place.get("id", "")),
+        })
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            conn.execute(
+                "INSERT INTO search_memory (user_id, query, korean_query, results_json) VALUES (?, ?, ?, ?)",
+                (str(user_id), str(query)[:500], str(korean_query)[:500], json.dumps(compact_places, ensure_ascii=False)),
+            )
+            # Keep the newest 100 search memories per user to limit database growth.
+            conn.execute("""
+                DELETE FROM search_memory WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM search_memory WHERE user_id = ? ORDER BY id DESC LIMIT 100
+                )
+            """, (str(user_id), str(user_id)))
+            conn.commit()
+    except sqlite3.Error:
+        logging.exception("Could not save search memory")
+
+
+def get_search_memory_context(user_id, limit=8):
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT query, korean_query, results_json, created_at FROM search_memory "
+                "WHERE user_id = ? ORDER BY id DESC LIMIT ?", (str(user_id), limit)
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not read search memory")
+        return ""
+    if not rows:
+        return ""
+    lines = ["СОХРАНЁННЫЕ ПОИСКИ ЭТОГО ПОЛЬЗОВАТЕЛЯ (это личная память TrustMap, не официальный рейтинг):"]
+    for query, korean_query, raw_json, created_at in reversed(rows):
+        lines.append(f"- Дата: {created_at}; запрос: {query}; корейский запрос: {korean_query}")
+        try:
+            places = json.loads(raw_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            places = []
+        for place in places[:8]:
+            line = f"  • {place.get('name', 'Место')}; адрес: {place.get('address', 'не указан')}"
+            if place.get("phone"):
+                line += f"; телефон: {place['phone']}"
+            if place.get("url"):
+                line += f"; ссылка: {place['url']}"
+            lines.append(line)
+    lines.append("Если пользователь спрашивает, что искал раньше, отвечай только по этим сохранённым данным. Если нужной записи нет, честно скажи, что она не сохранилась.")
+    return "\n".join(lines)
+
+
+def track_chat_message(chat_id, message_id):
+    """Track recent message IDs so the clear button can delete what Telegram permits."""
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_messages (chat_id, message_id) VALUES (?, ?)",
+                (str(chat_id), int(message_id)),
+            )
+            conn.execute("""
+                DELETE FROM chat_messages WHERE chat_id = ? AND id NOT IN (
+                    SELECT id FROM chat_messages WHERE chat_id = ? ORDER BY id DESC LIMIT 300
+                )
+            """, (str(chat_id), str(chat_id)))
+            conn.commit()
+    except sqlite3.Error:
+        logging.exception("Could not track chat message")
+
+
+class ChatMessageTrackingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.chat and event.message_id:
+            track_chat_message(event.chat.id, event.message_id)
+        return await handler(event, data)
+
+
+_original_send_message = Bot.send_message
+
+
+async def _tracked_send_message(self, chat_id, text, *args, **kwargs):
+    sent = await _original_send_message(self, chat_id, text, *args, **kwargs)
+    if sent and getattr(sent, "message_id", None) is not None:
+        track_chat_message(chat_id, sent.message_id)
+    return sent
+
+
+# Track messages sent via Message.answer(), including callback-driven replies.
+Bot.send_message = _tracked_send_message
+dp.message.outer_middleware(ChatMessageTrackingMiddleware())
+
+
+async def clear_tracked_chat(bot, chat_id):
+    """Best-effort deletion of tracked recent messages in a private chat."""
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT message_id FROM chat_messages WHERE chat_id = ? ORDER BY message_id DESC",
+                (str(chat_id),),
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not load chat messages for clearing")
+        rows = []
+    deleted = 0
+    failed = 0
+    for (message_id,) in rows:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+            deleted += 1
+        except Exception:
+            # Telegram may reject old messages, protected/service messages, or IDs
+            # the bot no longer has permission to delete. Continue with the rest.
+            failed += 1
+        await asyncio.sleep(0.04)
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            conn.execute("DELETE FROM chat_messages WHERE chat_id = ?", (str(chat_id),))
+            conn.commit()
+    except sqlite3.Error:
+        logging.exception("Could not clear tracked chat message IDs")
+    return deleted, failed
 
 
 def make_keyboard():
@@ -246,20 +405,34 @@ async def search_kakao(query):
         return None, "Поиск не настроен: отсутствует ключ Kakao."
     url = "https://dapi.kakao.com/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {KAKAO_KEY}"}
-    params = {"query": query, "size": 5, "page": 1}
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=25)
+    results = []
+    seen = set()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, params=params) as response:
-                if response.status == 401:
-                    return None, "Kakao не принял API-ключ. Проверь его настройки."
-                if response.status == 403:
-                    return None, "Kakao отклонил запрос (HTTP 403). Проверь доступ к Local API."
-                if response.status != 200:
-                    logging.error("Kakao API error HTTP %s", response.status)
-                    return None, f"Ошибка поиска Kakao: HTTP {response.status}."
-                data = await response.json()
-                return data.get("documents", []), None
+            # Kakao returns at most 15 results per page. Fetch up to 3 pages (45 results).
+            for page in range(1, 4):
+                params = {"query": query, "size": 15, "page": page}
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 401:
+                        return None, "Kakao не принял API-ключ. Проверь его настройки."
+                    if response.status == 403:
+                        return None, "Kakao отклонил запрос (HTTP 403). Проверь доступ к Local API."
+                    if response.status != 200:
+                        logging.error("Kakao API error HTTP %s", response.status)
+                        return None, f"Ошибка поиска Kakao: HTTP {response.status}."
+                    data = await response.json()
+                documents = data.get("documents", [])
+                for place in documents:
+                    place_id = str(place.get("id", ""))
+                    key = place_id or (place.get("place_name"), place.get("address_name"))
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(place)
+                meta = data.get("meta", {})
+                if not documents or meta.get("is_end", True):
+                    break
+        return results, None
     except asyncio.TimeoutError:
         return None, "Поиск занял слишком много времени. Попробуй позже."
     except aiohttp.ClientError:
@@ -285,8 +458,12 @@ async def ask_ai(question, user_id):
         return "🤖 ИИ пока не подключён. Проверь OPENAI_API_KEY в Environment на Render."
     history = CONVERSATION_HISTORY.setdefault(str(user_id), [])
     input_messages = history[-MAX_HISTORY_MESSAGES:] + [{"role": "user", "content": question}]
+    memory_context = get_search_memory_context(user_id)
+    instructions = AI_INSTRUCTIONS
+    if memory_context:
+        instructions += "\n\n" + memory_context
     payload = {
-        "model": AI_MODEL, "instructions": AI_INSTRUCTIONS,
+        "model": AI_MODEL, "instructions": instructions,
         "input": input_messages, "max_output_tokens": 1000, "store": False,
     }
     headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
@@ -340,6 +517,8 @@ def describe_category(place):
         ("스포츠용품", "Спортивные товары"), ("세탁소", "Прачечная"),
         ("공원", "Парк"), ("박물관", "Музей"), ("학교", "Школа"),
         ("의류", "Магазин одежды"), ("PC방", "Компьютерный клуб"),
+        ("찜질방", "Корейская баня / ччимчильбан"), ("목욕탕", "Общественная баня"),
+        ("사우나", "Сауна"), ("스파", "СПА-центр"),
         ("렌터카", "Аренда автомобилей"), ("부동산", "Недвижимость"),
     ]
     for korean, russian in descriptions:
@@ -462,7 +641,36 @@ async def run_place_search(message, query, user_id):
         return
     LAST_PLACE_SEARCH[str(user_id)] = query
     await message.answer("🔎 Ищу места. Подожди немного...")
-    places, error = await search_kakao(korean_query)
+
+    q_normalized = normalize(query)
+    city_ko = next((city for city in set(CITIES.values()) if city in korean_query), "")
+    variants = [korean_query]
+    is_bath_search = any(word in q_normalized for word in ("баня", "бани", "сауна", "сауны", "джимджильбан", "ччимчильбан", "스파", "찜질방", "목욕탕", "사우나"))
+    is_pc_search = any(word in q_normalized for word in ("компьютерный клуб", "компьютерные клубы", "пк клуб", "pc방", "피시방"))
+    if city_ko and is_bath_search:
+        variants = [f"찜질방 {city_ko}", f"목욕탕 {city_ko}", f"사우나 {city_ko}", f"스파 {city_ko}"]
+    elif city_ko and is_pc_search:
+        variants = [f"PC방 {city_ko}", f"피시방 {city_ko}", f"인터넷카페 {city_ko}"]
+
+    places = []
+    seen_ids = set()
+    error = None
+    for variant in variants:
+        found, search_error = await search_kakao(variant)
+        if search_error:
+            error = search_error
+            break
+        for place in found or []:
+            place_id = str(place.get("id", ""))
+            key = place_id or (place.get("place_name"), place.get("address_name"))
+            if key not in seen_ids:
+                seen_ids.add(key)
+                places.append(place)
+        if len(places) >= 45:
+            places = places[:45]
+            break
+    if not error:
+        save_search_memory(user_id, query, " | ".join(variants), places)
     if error:
         await message.answer(error)
         return
@@ -651,6 +859,8 @@ async def finish_housing_flow(message, user_id, city_label, city_ko):
         "ℹ️ Kakao Local показывает агентства и места, а не подтверждённые актуальные объявления аренды.",
     )
     places, error = await search_kakao(query)
+    if not error:
+        save_search_memory(user_id, f"агентства недвижимости в {city_label}", query, places or [])
     if error:
         await message.answer(error, reply_markup=make_keyboard())
         return
@@ -738,6 +948,7 @@ async def finish_clothing_flow(message, user_id, city_text):
             break
 
     if not places:
+        save_search_memory(user_id, f"магазины одежды в {city_text}", used_query, [])
         await message.answer(
             f"😔 Kakao не нашёл подходящие магазины одежды в городе «{city_text}» по нескольким вариантам запроса. "
             "Попробуй другой город или выбери «Любая» категория одежды.",
@@ -746,6 +957,7 @@ async def finish_clothing_flow(message, user_id, city_text):
         return
 
     LAST_PLACE_SEARCH[user_id] = used_query
+    save_search_memory(user_id, f"магазины одежды в {city_text}", used_query, places)
     for i, place in enumerate(places, 1):
         place_id = str(place.get("id", ""))
         summary = get_review_summary(place_id) if place_id else {}
@@ -1003,6 +1215,32 @@ async def handle_message(message: Message):
     is_menu_item = any(text in row for row in CATEGORIES)
     active_flow = USER_FLOWS.get(user_id)
 
+    if text == "🧹 Очистить чат":
+        CONVERSATION_HISTORY.pop(user_id, None)
+        USER_FLOWS.pop(user_id, None)
+        LAST_PLACE_SEARCH.pop(user_id, None)
+        deleted, failed = await clear_tracked_chat(message.bot, message.chat.id)
+        note = ""
+        if failed:
+            note = f"\n\nℹ️ Telegram не разрешил удалить {failed} старых или недоступных сообщений."
+        await message.answer(
+            "🧹 Начинаем с чистого листа!\n\n"
+            f"Удалено сообщений из чата: {deleted}.{note}\n\n"
+            "🧠 Сохранённые поиски мест, адреса и ссылки остались в памяти TrustMap. Можешь спросить: «Помнишь, какую аптеку я искал?».\n\n"
+            "Новый диалог готов 👇",
+            reply_markup=make_keyboard(),
+        )
+        return
+
+    if any(phrase in q for phrase in ("помнишь", "что я искал раньше", "что я искала раньше", "мой прошлый поиск", "предыдущий поиск")):
+        memory = get_search_memory_context(user_id)
+        if memory:
+            await message.answer("🧠 Проверяю сохранённую память…")
+            await send_long_message(message, await ask_ai(text, message.from_user.id))
+        else:
+            await message.answer("🧠 Пока у меня нет сохранённых поисков. Когда найдём место через поиск TrustMap, я смогу сохранить его название, адрес и ссылку для будущих вопросов.")
+        return
+
     # При выборе «Другое» принимаем свободный ответ и продолжаем текущий сценарий.
     if active_flow and active_flow.get("kind") == "housing" and active_flow.get("awaiting_custom") and not is_menu_item:
         custom_stage = active_flow.pop("awaiting_custom")
@@ -1012,7 +1250,8 @@ async def handle_message(message: Message):
     # Продолжаем активный сценарий, если пользователь отвечает на вопрос о городе.
     if active_flow and active_flow.get("stage") == "city" and not is_menu_item:
         # Если вместо города прислали новый запрос, запускаем новый запрос отдельно.
-        if is_place_search(text) and not find_city(text):
+        # Any fresh place-search message replaces the pending query, even if it already contains a city.
+        if is_place_search(text):
             USER_FLOWS.pop(user_id, None)
         else:
             city_ko = find_city(text)
@@ -1059,6 +1298,12 @@ async def handle_message(message: Message):
                 await message.answer("💰 Напиши товар или услугу и, по возможности, бюджет. Если город нужен для поиска, я уточню его.")
             elif text == "🛍️ Магазины":
                 await message.answer("🛍️ Что ищем? Например: «одежду», «детские товары» или «косметику».")
+            elif text == "🧖 Бани и сауны":
+                USER_FLOWS[user_id] = {"kind": "search", "stage": "city", "values": {"query": "бани сауны ччимчильбан"}}
+                await message.answer("🧖 Найдём бани, ччимчильбаны и сауны. Выбери город:", reply_markup=city_keyboard())
+            elif text == "🎮 Компьютерные клубы":
+                USER_FLOWS[user_id] = {"kind": "search", "stage": "city", "values": {"query": "компьютерные клубы PC방"}}
+                await message.answer("🎮 Найдём компьютерные клубы (PC방). Выбери город:", reply_markup=city_keyboard())
             elif text == "🏠 Недвижимость":
                 await start_housing_flow(message, user_id)
             else:
