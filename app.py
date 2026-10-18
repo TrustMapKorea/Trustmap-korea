@@ -22,6 +22,7 @@ KAKAO_KEY = os.getenv("KAKAO_REST_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "trustmap.db")
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 
 dp = Dispatcher()
 CONVERSATION_HISTORY = {}
@@ -40,6 +41,7 @@ CATEGORIES = [
     ["📍 Достопримечательности", "💰 Сравнение цен"],
     ["🧖 Бани и сауны", "🎮 Компьютерные клубы"],
     ["🤖 ИИ-помощник", "🌐 Язык / Language"],
+    ["💬 Отзыв о боте"],
     ["🧹 Очистить чат"],
 ]
 
@@ -99,7 +101,7 @@ STOPWORDS = {
     "найди", "покажи", "ищу", "нужен", "нужна", "нужно", "есть", "самый",
     "самая", "самое", "дешевый", "дешевая", "недорогой", "недорогая",
     "лучший", "лучшая", "лучшие", "the", "in", "near", "find", "show",
-    "please", "городе", "город", "корее", "южной", "машину", "машины",
+    "please", "городе", "город", "корее", "южной", "машину", "машины", "или", "ли", "and", "or",
     "авто", "автомобиль", "аренда", "аренду", "прокат", "хочу", "купить",
 }
 PLACE_HINTS = set(TERMS.keys()) | {
@@ -160,6 +162,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
             message_id INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(chat_id, message_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bot_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+            username TEXT, language_code TEXT, feedback_type TEXT NOT NULL,
+            message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit()
 
 
@@ -525,18 +531,34 @@ def budget_search_terms(query, pref):
 
 
 def build_search_queries(query, budget):
-    """Build varied Korean queries while keeping city constraints when supplied."""
-    city = find_city(query)
+    """Build several focused Korean keywords; Kakao keyword search works best with concise terms."""
+    city = find_city(query) or ""
     qnorm = normalize(query)
-    if any(word in qnorm for word in ("응급", "скорая", "неотлож", "экстренн")):
-        terms = EMERGENCY_QUERIES
-    elif any(word in qnorm for word in ("медицин", "больниц", "клиник", "аптек", "стомат", "врач")):
-        terms = MEDICAL_QUERIES
-    else:
-        return budget_search_terms(query, budget)
 
-    # Do not run a nationwide fan-out of every medical term; keep requests bounded.
-    return [f"{term} {city}".strip() for term in terms[:8]]
+    if any(word in qnorm for word in ("응급", "скорая", "неотлож", "экстренн")):
+        terms = EMERGENCY_QUERIES[:3]
+    elif any(word in qnorm for word in ("медицин", "больниц", "клиник", "аптек", "стомат", "врач", "병원", "의원")):
+        terms = MEDICAL_QUERIES[:8]
+    elif any(word in qnorm for word in ("кафе", "кофейн", "ресторан", "음식점", "카페")):
+        terms = ["카페", "음식점", "식당"]
+    elif any(word in qnorm for word in ("автосервис", "автозапчаст", "запчаст", "авто и запчасти", "자동차 정비", "자동차 부품")):
+        terms = ["자동차 정비소", "자동차 수리", "자동차 부품"]
+    elif any(word in qnorm for word in ("магазин", "магазины", "супермаркет", "마트")):
+        terms = ["마트", "매장", "슈퍼마켓"]
+    elif any(word in qnorm for word in ("отель", "гостиниц", "호텔")):
+        terms = ["호텔", "모텔", "게스트하우스"]
+    elif any(word in qnorm for word in ("салон красоты", "парикмах", "красоты", "미용실")):
+        terms = ["미용실", "헤어샵", "네일샵"]
+    elif any(word in qnorm for word in ("аренд", "прокат", "렌터카")):
+        terms = budget_search_terms(query, budget)
+        return list(dict.fromkeys(terms))
+    else:
+        terms = budget_search_terms(query, budget)
+        # Keep the original translated query as a fallback, but avoid duplicate requests.
+        return list(dict.fromkeys(q for q in terms if q.strip()))
+
+    queries = [f"{term} {city}".strip() for term in terms]
+    return list(dict.fromkeys(q for q in queries if q.strip()))
 
 
 AI_INSTRUCTIONS = (
@@ -601,10 +623,7 @@ async def send_long(message, text):
 async def run_place_search(message, query, user_id, budget="any"):
     city_ko = find_city(query)
     search_queries = build_search_queries(query, budget)
-    await message.answer(
-        "🔎 Ищу реальные места по данным Kakao. "
-        "Можно продолжать пользоваться ботом — новый запрос остановит предыдущий поиск."
-    )
+    await message.answer("🔎 Ищу места...")
 
     places, seen, used = [], set(), []
     current_task = asyncio.current_task()
@@ -632,8 +651,8 @@ async def run_place_search(message, query, user_id, budget="any"):
     if not places:
         location = CITY_LABELS.get(city_ko, city_ko) if city_ko else "Южной Корее"
         await message.answer(
-            f"😔 По запросу «{query}» в {location} ничего не найдено.\n"
-            "Попробуй изменить запрос или указать город.",
+            f"😔 По запросу «{query}» в {location} Kakao не вернул результатов.\n"
+            "Это не означает, что таких мест нет: попробуй более короткий запрос или другой город.",
             reply_markup=make_keyboard()
         )
         return
@@ -669,6 +688,83 @@ async def run_place_search(message, query, user_id, budget="any"):
         "Каждый пользователь может изменить свою оценку.",
         reply_markup=make_keyboard()
     )
+
+
+def feedback_kind_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😍 Что нравится", callback_data="feedback:like")],
+        [InlineKeyboardButton(text="🙁 Что не нравится", callback_data="feedback:dislike")],
+        [InlineKeyboardButton(text="💡 Идея / предложение", callback_data="feedback:idea")],
+        [InlineKeyboardButton(text="🐞 Ошибка в боте", callback_data="feedback:bug")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="feedback:cancel")],
+    ])
+
+
+FEEDBACK_LABELS = {
+    "like": "Что нравится", "dislike": "Что не нравится",
+    "idea": "Идея / предложение", "bug": "Ошибка в боте",
+}
+
+
+@dp.callback_query(F.data.startswith("feedback:"))
+async def feedback_callback(callback: CallbackQuery):
+    user_id = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
+    if choice == "cancel":
+        USER_FLOWS.pop(user_id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Отменено")
+        return
+    if choice not in FEEDBACK_LABELS:
+        await callback.answer("Неизвестный вариант.", show_alert=True)
+        return
+    USER_FLOWS[user_id] = {"kind": "feedback", "stage": "message", "values": {"type": choice}}
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"✍️ Напиши одним сообщением: {FEEDBACK_LABELS[choice].lower()}.\n"
+        "Можно написать подробно. Не отправляй пароли, номера документов или банковские данные."
+    )
+    await callback.answer()
+
+
+@dp.message(Command("myid"))
+async def my_id_command(message: Message):
+    await message.answer(
+        f"Твой Telegram ID: {message.from_user.id}\n"
+        "Чтобы получать отзывы в личный Telegram, добавь это число в Render как переменную ADMIN_TELEGRAM_ID."
+    )
+
+
+@dp.message(Command("feedbacks"))
+async def owner_feedbacks(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору бота.")
+        return
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT id, user_id, username, feedback_type, message, created_at "
+                "FROM bot_feedback ORDER BY id DESC LIMIT 30"
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not read bot feedback")
+        await message.answer("Не удалось прочитать отзывы из базы данных.")
+        return
+    if not rows:
+        await message.answer("Пока отзывов о боте нет.")
+        return
+    chunks, current = [], "💬 ПОСЛЕДНИЕ ОТЗЫВЫ TRUSTMAP KOREA\n\n"
+    for rid, uid, username, kind, body, created in rows:
+        uname = f"@{username}" if username else "не указан"
+        item = f"#{rid} · {created}\nТип: {FEEDBACK_LABELS.get(kind, kind)}\nПользователь: {uname} (ID {uid})\n{body}\n\n━━━━━━━━━━━━\n\n"
+        if len(current) + len(item) > 3500:
+            chunks.append(current)
+            current = ""
+        current += item
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 @dp.message(CommandStart())
@@ -875,6 +971,48 @@ async def handle_message(message: Message):
     if text == "🌐 Язык / Language":
         USER_FLOWS.pop(uid, None)
         await message.answer("🌐 Пиши по-русски, по-английски или по-корейски. Я отвечу на языке сообщения.")
+        return
+
+    if text == "💬 Отзыв о боте" or q == "/feedback":
+        USER_FLOWS[uid] = {"kind": "feedback_select", "stage": "type", "values": {}}
+        await message.answer("💬 Помоги сделать TrustMap Korea лучше. Что хочешь сообщить?", reply_markup=feedback_kind_keyboard())
+        return
+
+    flow_now = USER_FLOWS.get(uid)
+    if flow_now and flow_now.get("kind") == "feedback" and flow_now.get("stage") == "message":
+        body = text.strip()
+        if len(body) < 3:
+            await message.answer("Напиши, пожалуйста, чуть подробнее (минимум 3 символа).")
+            return
+        kind = flow_now.get("values", {}).get("type", "idea")
+        username = message.from_user.username or None
+        try:
+            with db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO bot_feedback(user_id,username,language_code,feedback_type,message) VALUES(?,?,?,?,?)",
+                    (uid, username, getattr(message.from_user, "language_code", None), kind, body[:4000])
+                )
+                feedback_id = cur.lastrowid
+                conn.commit()
+        except sqlite3.Error:
+            logging.exception("Could not save bot feedback")
+            await message.answer("Не удалось сохранить отзыв. Попробуй ещё раз позже.", reply_markup=make_keyboard())
+            USER_FLOWS.pop(uid, None)
+            return
+        USER_FLOWS.pop(uid, None)
+        await message.answer("💙 Спасибо! Отзыв сохранён. Он поможет сделать TrustMap Korea лучше.", reply_markup=make_keyboard())
+        if ADMIN_TELEGRAM_ID:
+            try:
+                await message.bot.send_message(
+                    int(ADMIN_TELEGRAM_ID),
+                    f"💬 НОВЫЙ ОТЗЫВ TRUSTMAP KOREA #{feedback_id}\n"
+                    f"Тип: {FEEDBACK_LABELS.get(kind, kind)}\n"
+                    f"Пользователь: @{username or 'без username'} (ID {uid})\n"
+                    f"Язык Telegram: {getattr(message.from_user, 'language_code', None) or 'не указан'}\n\n{body[:3500]}\n\n"
+                    "Читать сохранённые отзывы: /feedbacks"
+                )
+            except Exception:
+                logging.exception("Could not notify bot owner about feedback")
         return
 
     if text in [item for row in CATEGORIES for item in row]:
