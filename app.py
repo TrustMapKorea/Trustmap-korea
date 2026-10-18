@@ -566,7 +566,10 @@ AI_INSTRUCTIONS = (
     "Используй контекст переписки, исправляй очевидные опечатки. Не выдумывай адреса, цены, "
     "рейтинги, часы работы, законы или официальные правила. Отличай пользовательские оценки "
     "TrustMap от официальных рейтингов. Для медицинских, юридических и иммиграционных тем отвечай осторожно. "
-    "При угрозе жизни в Южной Корее укажи, что номер экстренной помощи — 119."
+    "При угрозе жизни в Южной Корее укажи, что номер экстренной помощи — 119. "
+    "Будь практичным: предлагай пошаговые действия, корейские фразы с переводом и ссылки на первоисточники. "
+    "Для изменяющейся информации проверяй свежие источники через веб-поиск, если он доступен. "
+    "Не обещай полный охват интернета и не придумывай источники."
 )
 
 
@@ -579,12 +582,21 @@ async def ask_ai(question, user_id):
     if memory:
         instructions += "\n\n" + memory
     payload = {
-        "model": AI_MODEL, "instructions": instructions,
+        "model": AI_MODEL,
+        "instructions": instructions + "\n\n"
+            "Для актуальных вопросов о Корее, новостях, правилах, маршрутах, услугах и фактах "
+            "используй встроенный веб-поиск, если он доступен. Ищи по нескольким релевантным "
+            "запросам и предпочитай официальные источники. Указывай ссылки на источники в ответе. "
+            "Не утверждай, что проверил весь интернет: доступен только поиск, разрешённый инструментом. "
+            "Если веб-поиск не сработал или источники не подтверждают факт, честно сообщи об этом.",
         "input": history[-MAX_HISTORY_MESSAGES:] + [{"role": "user", "content": question}],
-        "max_output_tokens": 1000, "store": False
+        "max_output_tokens": 1400,
+        "store": False,
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "auto"
     }
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
             async with session.post(
                 "https://api.openai.com/v1/responses",
                 headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
@@ -594,10 +606,29 @@ async def ask_ai(question, user_id):
                     return "OpenAI не принял API-ключ. Проверь OPENAI_API_KEY в Render."
                 if resp.status == 429:
                     return "ИИ временно недоступен: проверь лимиты и оплату OpenAI API."
-                if resp.status != 200:
+                if resp.status in (400, 404, 422):
+                    # If web search is unavailable for the selected model/account, retry once without it.
+                    error_body = (await resp.text())[:500]
+                    if "web_search" in error_body or "tool" in error_body.lower():
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
+                        async with session.post(
+                            "https://api.openai.com/v1/responses",
+                            headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
+                            json=payload
+                        ) as retry:
+                            if retry.status != 200:
+                                logging.error("OpenAI retry HTTP %s: %s", retry.status, (await retry.text())[:300])
+                                return f"Ошибка ИИ-сервиса: HTTP {retry.status}."
+                            data = await retry.json()
+                    else:
+                        logging.error("OpenAI HTTP %s: %s", resp.status, error_body)
+                        return f"Ошибка ИИ-сервиса: HTTP {resp.status}."
+                elif resp.status != 200:
                     logging.error("OpenAI HTTP %s: %s", resp.status, (await resp.text())[:300])
                     return f"Ошибка ИИ-сервиса: HTTP {resp.status}."
-                data = await resp.json()
+                else:
+                    data = await resp.json()
         answer = "\n".join(
             c.get("text", "") for item in data.get("output", [])
             if item.get("type") == "message"
@@ -765,6 +796,21 @@ async def owner_feedbacks(message: Message):
         chunks.append(current)
     for chunk in chunks:
         await message.answer(chunk)
+
+
+@dp.message(Command("clear"))
+async def clear_command(message: Message):
+    uid = str(message.from_user.id)
+    cancel_user_search(uid)
+    CONVERSATION_HISTORY.pop(uid, None)
+    USER_FLOWS.pop(uid, None)
+    deleted, failed = await clear_chat(message.bot, message.chat.id)
+    # Clear the user's in-memory conversation regardless of Telegram delete permissions.
+    notice = "🧹 Чат очищен. Начнём заново."
+    if failed:
+        notice += f"\nНекоторые сообщения Telegram не разрешил удалить ({failed})."
+    notice += "\nОценки мест, отзывы о боте и сохранённые поиски не удалены."
+    await message.answer(notice, reply_markup=make_keyboard())
 
 
 @dp.message(CommandStart())
@@ -956,9 +1002,8 @@ async def handle_message(message: Message):
         deleted, failed = await clear_chat(message.bot, message.chat.id)
         extra = f"\nTelegram не разрешил удалить {failed} сообщений." if failed else ""
         await message.answer(
-            f"🧹 Начинаем заново. Удалено сообщений: {deleted}.{extra}\n"
-            "Общие оценки заведений сохранены. История поиска для памяти тоже сохранена.\n"
-            "Напиши новый запрос или выбери категорию.",
+            f"🧹 Чат очищен. Удалено сообщений: {deleted}.{extra}\n"
+            "Оценки, отзывы о боте и сохранённые поиски не удалены.",
             reply_markup=make_keyboard()
         )
         return
