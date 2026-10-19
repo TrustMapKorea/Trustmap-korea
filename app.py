@@ -35,6 +35,51 @@ MAX_HISTORY_MESSAGES = 12
 PLACE_RESULTS = {}
 MAX_PLACE_RESULTS_PER_USER = 30
 
+# Curated photo spots inspired by publicly visible posts from the Instagram accounts
+# named by the bot owner. Recheck the venue/address before travelling; availability may change.
+PHOTO_SPOTS = {
+    "pins": {
+        "name": "Pins Coffee · 핀스커피",
+        "city": "Чхонан",
+        "address": "충남 천안시 동남구 해솔1길 27-29",
+        "vibe": "Сезонный сад и фотозоны; особенно красиво в сезон цветения.",
+        "source": "@_yh.yhh",
+        "map_query": "핀스커피 천안",
+    },
+    "river": {
+        "name": "River Nine · 리버나인",
+        "city": "Намъянджу",
+        "address": "경기 남양주시 화도읍 북한강로 1630-18",
+        "vibe": "Вид на реку Пукханган и просторная зелёная территория.",
+        "source": "@_yh.yhh",
+        "map_query": "리버나인 남양주",
+    },
+    "seaer": {
+        "name": "Seaer Pool Villa · 시어풀빌라",
+        "city": "Кёнджу",
+        "address": "경북 경주시 감포읍 감포로2길 54-3",
+        "vibe": "Морские виды и необычный интерьер. Это жильё: уточни правила посещения и бронирования.",
+        "source": "@_yh.yhh",
+        "map_query": "시어풀빌라 경주",
+    },
+    "rainbow": {
+        "name": "Rainbow Pension Espresso · 무지개펜션에스프레소",
+        "city": "Кодже",
+        "address": "경남 거제시 남부면 거제남서로 737",
+        "vibe": "Кафе с видом на побережье и панорамными окнами.",
+        "source": "@_yh.yhh",
+        "map_query": "무지개펜션에스프레소 거제",
+    },
+    "portrait": {
+        "name": "Portrait Coffee Bar",
+        "city": "Сеул · Мангвон-дон",
+        "address": "서울 마포구 포은로8길 32 1층",
+        "vibe": "Небольшое кафе с фотогеничным интерьером; подходит для фото за чашкой кофе.",
+        "source": "@my_season___",
+        "map_query": "Portrait Coffee Bar 망원동",
+    },
+}
+
 CATEGORIES = [
     ["🔎 Поиск мест", "🏥 Медицина"],
     ["🍽️ Кафе и рестораны", "🛍️ Магазины"],
@@ -43,10 +88,10 @@ CATEGORIES = [
     ["💄 Красота и уход", "👶 Товары для детей"],
     ["🧸 Игрушки", "🐾 Товары для животных"],
     ["🔧 Бытовые услуги", "🏨 Отели"],
-    ["📍 Достопримечательности", "💰 Сравнение цен"],
-    ["🧖 Бани и сауны", "🎮 Компьютерные клубы"],
-    ["🤖 ИИ-помощник", "🌐 Язык / Language"],
-    ["💬 Отзыв о боте"],
+    ["📍 Достопримечательности", "📸 Места для фото"],
+    ["💰 Сравнение цен", "🧖 Бани и сауны"],
+    ["🎮 Компьютерные клубы", "🤖 ИИ-помощник"],
+    ["🌐 Язык / Language", "💬 Отзыв о боте"],
     ["🧹 Очистить чат"],
 ]
 
@@ -339,7 +384,8 @@ def get_search_memory_context(user_id, limit=8):
         with db() as conn:
             rows = conn.execute(
                 "SELECT query,korean_query,results_json,created_at FROM search_memory "
-                "WHERE user_id=? ORDER BY id DESC LIMIT ?", (str(user_id), limit)
+                "WHERE user_id=? AND created_at >= datetime('now', '-7 days') "
+                "ORDER BY id DESC LIMIT ?", (str(user_id), limit)
             ).fetchall()
     except sqlite3.Error:
         logging.exception("Could not read search memory")
@@ -521,6 +567,42 @@ def describe_category(place):
         if key in cat:
             return label
     return place.get("category_name") or place.get("category_group_name") or "Категория не указана"
+
+
+def photo_spots_keyboard():
+    rows = [
+        [InlineKeyboardButton(text="🌸 Pins Coffee · Чхонан", callback_data="photo:pins")],
+        [InlineKeyboardButton(text="🌿 River Nine · Намъянджу", callback_data="photo:river")],
+        [InlineKeyboardButton(text="🌊 Seaer Pool Villa · Кёнджу", callback_data="photo:seaer")],
+        [InlineKeyboardButton(text="📷 Rainbow Pension · Кодже", callback_data="photo:rainbow")],
+        [InlineKeyboardButton(text="☕ Portrait Coffee Bar · Сеул", callback_data="photo:portrait")],
+        [InlineKeyboardButton(text="🔄 Обновить список", callback_data="photo:list")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def photo_spots_text():
+    return (
+        "📸 МЕСТА ДЛЯ КРАСИВЫХ ФОТО\n"
+        "Подборка по публичным публикациям Instagram\n\n"
+        "Выбери место — покажу адрес, идею для фото и карту.\n"
+        "📍 Адреса указаны на корейском, чтобы их было проще скопировать в навигатор."
+    )
+
+
+def photo_spot_detail(spot):
+    map_url = "https://map.kakao.com/link/search/" + quote_plus(spot["map_query"])
+    naver_url = "https://map.naver.com/p/search/" + quote_plus(spot["map_query"])
+    return (
+        f"📸 {spot['name']}\n"
+        f"📍 Район: {spot['city']}\n"
+        f"🗺️ Адрес: {spot['address']}\n\n"
+        f"✨ Для фото: {spot['vibe']}\n"
+        f"🔎 Источник подборки: Instagram {spot['source']}\n\n"
+        f"🗺️ Kakao Map: {map_url}\n"
+        f"🧭 Naver Map: {naver_url}\n\n"
+        "ℹ️ Перед поездкой проверь часы работы, доступ для посетителей и сезонность."
+    )
 
 
 def price_label(pref):
@@ -810,6 +892,21 @@ def feedback_kind_keyboard():
         [InlineKeyboardButton(text="🐞 Ошибка в боте", callback_data="feedback:bug")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="feedback:cancel")]
     ])
+
+
+@dp.callback_query(F.data.startswith("photo:"))
+async def photo_spot_callback(callback: CallbackQuery):
+    choice = (callback.data or "").split(":", 1)[1]
+    if choice == "list":
+        await callback.message.answer(photo_spots_text(), reply_markup=photo_spots_keyboard(), disable_web_page_preview=True)
+        await callback.answer("Список мест обновлён")
+        return
+    spot = PHOTO_SPOTS.get(choice)
+    if not spot:
+        await callback.answer("Место не найдено. Открой список заново.", show_alert=True)
+        return
+    await callback.message.answer(photo_spot_detail(spot), disable_web_page_preview=True)
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "places:new")
@@ -1393,6 +1490,9 @@ async def handle_message(message: Message):
 
     if text in [item for row in CATEGORIES for item in row]:
         USER_FLOWS.pop(uid, None)
+        if text == "📸 Места для фото":
+            await message.answer(photo_spots_text(), reply_markup=photo_spots_keyboard(), disable_web_page_preview=True)
+            return
         if text == "🏠 Недвижимость":
             USER_FLOWS[uid] = {"kind": "housing", "stage": "type", "values": {}}
             await message.answer("🏠 Какой тип жилья ищешь?", reply_markup=housing_type_keyboard())
@@ -1481,14 +1581,37 @@ async def handle_message(message: Message):
     await send_long(message, await ask_ai(text, message.from_user.id))
 
 
+async def daily_maintenance():
+    """Remove stale search snapshots daily; place reviews and bot feedback are preserved.
+
+    Search results are fetched from Kakao/web sources on each new search rather than reused
+    as a permanent listing cache. Saved search snapshots are only conversational memory and expire after seven days.
+    """
+    while True:
+        try:
+            with db() as conn:
+                conn.execute("DELETE FROM search_memory WHERE created_at < datetime('now', '-7 days')")
+                conn.commit()
+            logging.info("Daily maintenance complete: expired search snapshots cleaned; reviews preserved")
+        except Exception:
+            logging.exception("Daily maintenance failed")
+        await asyncio.sleep(24 * 60 * 60)
+
+
 async def main():
     if not TOKEN:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения.")
     init_db()
     bot = Bot(token=TOKEN)
+    maintenance_task = asyncio.create_task(daily_maintenance())
     try:
         await dp.start_polling(bot)
     finally:
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
+        except asyncio.CancelledError:
+            pass
         for task in list(SEARCH_TASKS.values()):
             if not task.done():
                 task.cancel()
