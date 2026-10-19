@@ -30,6 +30,10 @@ CONVERSATION_HISTORY = {}
 USER_FLOWS = {}
 SEARCH_TASKS = {}
 MAX_HISTORY_MESSAGES = 12
+# Telegram callback_data is limited to 64 bytes. Place IDs are kept in a short-lived
+# per-user cache; callbacks contain only the cache index.
+PLACE_RESULTS = {}
+MAX_PLACE_RESULTS_PER_USER = 30
 
 CATEGORIES = [
     ["🔎 Поиск мест", "🏥 Медицина"],
@@ -59,11 +63,11 @@ CITY_LABELS = {
     "대구": "Тэгу", "대전": "Тэджон", "수원": "Сувон", "평택": "Пхёнтхэк",
     "성남": "Соннам", "광주": "Кванджу",
 }
-CITY_CALLBACKS = {k: v for k, v in CITIES.items() if k in {
-    "cheonan", "seoul", "busan", "incheon", "daegu", "daejeon", "suwon",
-    "pyeongtaek", "seongnam", "gwangju"
-}}
-
+CITY_CALLBACKS = {
+    "cheonan": "천안", "seoul": "서울", "busan": "부산", "incheon": "인천",
+    "daegu": "대구", "daejeon": "대전", "suwon": "수원",
+    "pyeongtaek": "평택", "seongnam": "성남", "gwangju": "광주",
+}
 TERMS = {
     "кафе": "카페", "кофейня": "카페", "кофейни": "카페", "кофе": "카페",
     "ресторан": "음식점", "рестораны": "음식점", "еда": "음식점",
@@ -97,25 +101,59 @@ STOPWORDS = {
     "машины", "или", "ли", "and", "or", "авто", "автомобиль", "аренда", "аренду", "прокат",
     "хочу", "купить", "пожалуйста", "работа", "вакансии", "ищу", "найти",
 }
-PLACE_HINTS = set(TERMS.keys()) | {"игрушки", "игрушка", "магазин игрушек", "детские товары", "компьютерные клубы", "бани", "сауны"}
+PLACE_HINTS = set(TERMS.keys()) | {
+    "игрушки", "игрушка", "магазин игрушек", "детские товары",
+    "компьютерные клубы", "бани", "сауны"
+}
 AI_STARTS = (
     "как ", "почему ", "что ", "кто ", "когда ", "зачем ", "можно ли ", "помоги ",
     "объясни ", "переведи ", "посоветуй ", "how ", "why ", "what ", "who ", "when ",
     "help ", "translate ", "explain ",
 )
 AI_PHRASES = (
-    "как сказать", "что значит", "переведи на корейский", "переведи на русский", "объясни мне",
-    "помоги мне", "как правильно", "что делать если", "как работает", "can you help",
-    "translate into korean", "what does it mean",
+    "как сказать", "что значит", "переведи на корейский", "переведи на русский",
+    "объясни мне", "помоги мне", "как правильно", "что делать если",
+    "как работает", "can you help", "translate into korean", "what does it mean",
 )
 RATING_DIMENSIONS = {
     "overall": "Общая оценка", "quality": "Качество товара / услуги", "food": "Вкус еды",
     "speed": "Скорость обслуживания / выполнения", "waiting": "Время ожидания",
     "service": "Обслуживание и вежливость", "value": "Цена / качество",
-    "atmosphere": "Атмосфера и комфорт", "cleanliness": "Чистота", "communication": "Общение и объяснения",
+    "atmosphere": "Атмосфера и комфорт", "cleanliness": "Чистота",
+    "communication": "Общение и объяснения",
 }
-MEDICAL_QUERIES = ["병원", "종합병원", "대학병원", "의원", "내과", "소아과", "치과", "약국", "응급실", "이비인후과", "안과", "피부과"]
+MEDICAL_QUERIES = [
+    "병원", "종합병원", "대학병원", "의원", "내과", "소아과", "치과",
+    "약국", "응급실", "이비인후과", "안과", "피부과"
+]
 EMERGENCY_QUERIES = ["응급실", "응급의료기관", "119안전센터"]
+
+# Typical Korean housing types and their search keywords.
+HOUSING_TYPES = {
+    "housing:apartment": ("🏢 Апартаменты / 아파트", "아파트"),
+    "housing:villa": ("🏘️ Вилла / 빌라", "빌라"),
+    "housing:studio": ("🚪 Студия / 원룸", "원룸"),
+    "housing:two": ("🏠 Две комнаты / 투룸", "투룸"),
+    "housing:officetel": ("🏙️ Офистель / 오피스텔", "오피스텔"),
+    "housing:house": ("🏡 Дом / 단독주택", "단독주택"),
+    "housing:any": ("🔎 Любой тип жилья", "부동산"),
+}
+HOUSING_DEALS = {
+    "deal:monthly": ("월세 — ежемесячная аренда", "monthly"),
+    "deal:jeonse": ("전세 — чонсе, крупный залог", "jeonse"),
+    "deal:sale": ("매매 — покупка", "sale"),
+    "deal:any": ("🔎 Любой вариант", "any"),
+}
+MONTHLY_PRESETS = [
+    ("До 300 000 ₩", 300000), ("До 400 000 ₩", 400000),
+    ("До 500 000 ₩", 500000), ("До 600 000 ₩", 600000),
+    ("До 700 000 ₩", 700000), ("До 1 000 000 ₩", 1000000),
+]
+DEPOSIT_PRESETS = [
+    ("Без залога", 0), ("До 1 млн ₩", 1000000), ("До 3 млн ₩", 3000000),
+    ("До 5 млн ₩", 5000000), ("До 10 млн ₩", 10000000),
+    ("До 20 млн ₩", 20000000),
+]
 
 
 def db():
@@ -195,43 +233,102 @@ def translate_query(text):
     return " ".join(out).strip()
 
 
+def is_job_query(text):
+    q = normalize(text)
+    terms = ("ваканс", "работ", "подработ", "трудоустрой", "зарплат", "работник",
+             "работу", "работать", "일자리", "구인", "채용", "아르바이트", "알바")
+    return any(term in q for term in terms) or q == "💼 работа"
+
+
 def is_place_search(text):
     q = normalize(text)
     if any(x in q for x in ("сколько стоит", "что значит", "как сказать", "переведи", "почему", "объясни")):
         return False
     if is_job_query(text):
         return False
-    return any(hint in q for hint in PLACE_HINTS) or (bool(find_city(q)) and any(w in q for w in ("найди", "найти", "покажи", "поиск", "find", "show", "search")))
-
-
-def is_job_query(text):
-    q = normalize(text)
-    terms = ("ваканс", "работ", "подработ", "трудоустрой", "зарплат", "работник", "работу", "работать", "일자리", "구인", "채용", "아르바이트", "알바")
-    return any(term in q for term in terms) or q == "💼 работа"
+    return any(hint in q for hint in PLACE_HINTS) or (
+        bool(find_city(q)) and any(w in q for w in ("найди", "найти", "покажи", "поиск", "find", "show", "search"))
+    )
 
 
 def make_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=x) for x in row] for row in CATEGORIES], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=x) for x in row] for row in CATEGORIES],
+        resize_keyboard=True
+    )
 
 
 def city_keyboard():
-    items = [("📍 Чхонан", "cheonan"), ("🏙️ Сеул", "seoul"), ("🌊 Пусан", "busan"), ("✈️ Инчхон", "incheon"), ("🌆 Тэгу", "daegu"), ("🏙️ Тэджон", "daejeon"), ("🏘️ Сувон", "suwon"), ("📍 Пхёнтхэк", "pyeongtaek"), ("🏙️ Соннам", "seongnam"), ("📍 Кванджу", "gwangju")]
-    rows = [[InlineKeyboardButton(text=t, callback_data=f"city:{k}") for t, k in items[i:i+2]] for i in range(0, len(items), 2)]
-    rows += [[InlineKeyboardButton(text="✍️ Другой город", callback_data="city:other")], [InlineKeyboardButton(text="🌏 Искать по Корее", callback_data="city:nationwide")], [InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")]]
+    items = [
+        ("📍 Чхонан", "cheonan"), ("🏙️ Сеул", "seoul"), ("🌊 Пусан", "busan"),
+        ("✈️ Инчхон", "incheon"), ("🌆 Тэгу", "daegu"), ("🏙️ Тэджон", "daejeon"),
+        ("🏘️ Сувон", "suwon"), ("📍 Пхёнтхэк", "pyeongtaek"),
+        ("🏙️ Соннам", "seongnam"), ("📍 Кванджу", "gwangju")
+    ]
+    rows = [[InlineKeyboardButton(text=t, callback_data=f"city:{k}") for t, k in items[i:i+2]]
+            for i in range(0, len(items), 2)]
+    rows += [
+        [InlineKeyboardButton(text="✍️ Другой город", callback_data="city:other")],
+        [InlineKeyboardButton(text="🌏 Искать по Корее", callback_data="city:nationwide")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")]
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def preference_keyboard():
-    options = [("💸 Самый дешёвый", "cheap"), ("⚖️ Средний бюджет", "mid"), ("💎 Дорогой / премиум", "premium"), ("🔎 Любой вариант", "any")]
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"budget:{v}") for t, v in options[:2]], [InlineKeyboardButton(text=t, callback_data=f"budget:{v}") for t, v in options[2:]], [InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")]])
+    options = [
+        ("💸 Самый дешёвый", "cheap"), ("⚖️ Средний бюджет", "mid"),
+        ("💎 Дорогой / премиум", "premium"), ("🔎 Любой вариант", "any")
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t, callback_data=f"budget:{v}") for t, v in options[:2]],
+        [InlineKeyboardButton(text=t, callback_data=f"budget:{v}") for t, v in options[2:]],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")]
+    ])
+
+
+def housing_type_keyboard():
+    rows = [[InlineKeyboardButton(text=label, callback_data=key)]
+            for key, (label, _) in HOUSING_TYPES.items()]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="housing:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def housing_deal_keyboard():
+    rows = [[InlineKeyboardButton(text=label, callback_data=key)]
+            for key, (label, _) in HOUSING_DEALS.items()]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="housing:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def housing_price_keyboard(kind):
+    presets = MONTHLY_PRESETS if kind == "monthly" else DEPOSIT_PRESETS
+    prefix = "monthlyprice" if kind == "monthly" else "deposit"
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}:{amount}")]
+            for label, amount in presets]
+    rows.append([InlineKeyboardButton(text="✍️ Ввести свою сумму", callback_data=f"{prefix}:custom")])
+    rows.append([InlineKeyboardButton(text="🔎 Любая сумма", callback_data=f"{prefix}:any")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="housing:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def save_search_memory(user_id, query, korean_query, places):
-    compact = [{"name": p.get("place_name", "Название не указано"), "address": p.get("road_address_name") or p.get("address_name") or "Адрес не указан", "phone": p.get("phone") or "", "url": p.get("place_url") or "", "id": str(p.get("id", ""))} for p in (places or [])[:20]]
+    compact = [{
+        "name": p.get("place_name", "Название не указано"),
+        "address": p.get("road_address_name") or p.get("address_name") or "Адрес не указан",
+        "phone": p.get("phone") or "", "url": p.get("place_url") or "", "id": str(p.get("id", ""))
+    } for p in (places or [])[:20]]
     try:
         with db() as conn:
-            conn.execute("INSERT INTO search_memory(user_id,query,korean_query,results_json) VALUES(?,?,?,?)", (str(user_id), str(query)[:500], str(korean_query)[:500], json.dumps(compact, ensure_ascii=False)))
-            conn.execute("DELETE FROM search_memory WHERE user_id=? AND id NOT IN (SELECT id FROM search_memory WHERE user_id=? ORDER BY id DESC LIMIT 100)", (str(user_id), str(user_id)))
+            conn.execute(
+                "INSERT INTO search_memory(user_id,query,korean_query,results_json) VALUES(?,?,?,?)",
+                (str(user_id), str(query)[:500], str(korean_query)[:500], json.dumps(compact, ensure_ascii=False))
+            )
+            conn.execute(
+                "DELETE FROM search_memory WHERE user_id=? AND id NOT IN "
+                "(SELECT id FROM search_memory WHERE user_id=? ORDER BY id DESC LIMIT 100)",
+                (str(user_id), str(user_id))
+            )
             conn.commit()
     except sqlite3.Error:
         logging.exception("Could not save search memory")
@@ -240,7 +337,10 @@ def save_search_memory(user_id, query, korean_query, places):
 def get_search_memory_context(user_id, limit=8):
     try:
         with db() as conn:
-            rows = conn.execute("SELECT query,korean_query,results_json,created_at FROM search_memory WHERE user_id=? ORDER BY id DESC LIMIT ?", (str(user_id), limit)).fetchall()
+            rows = conn.execute(
+                "SELECT query,korean_query,results_json,created_at FROM search_memory "
+                "WHERE user_id=? ORDER BY id DESC LIMIT ?", (str(user_id), limit)
+            ).fetchall()
     except sqlite3.Error:
         logging.exception("Could not read search memory")
         return ""
@@ -262,8 +362,15 @@ def get_search_memory_context(user_id, limit=8):
 def track_message(chat_id, message_id):
     try:
         with db() as conn:
-            conn.execute("INSERT OR IGNORE INTO chat_messages(chat_id,message_id) VALUES(?,?)", (str(chat_id), int(message_id)))
-            conn.execute("DELETE FROM chat_messages WHERE chat_id=? AND id NOT IN (SELECT id FROM chat_messages WHERE chat_id=? ORDER BY id DESC LIMIT 300)", (str(chat_id), str(chat_id)))
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_messages(chat_id,message_id) VALUES(?,?)",
+                (str(chat_id), int(message_id))
+            )
+            conn.execute(
+                "DELETE FROM chat_messages WHERE chat_id=? AND id NOT IN "
+                "(SELECT id FROM chat_messages WHERE chat_id=? ORDER BY id DESC LIMIT 300)",
+                (str(chat_id), str(chat_id))
+            )
             conn.commit()
     except sqlite3.Error:
         logging.exception("Could not track message")
@@ -277,11 +384,15 @@ class TrackingMiddleware(BaseMiddleware):
 
 
 _original_send_message = Bot.send_message
+
+
 async def _tracked_send_message(self, chat_id, text, *args, **kwargs):
     result = await _original_send_message(self, chat_id, text, *args, **kwargs)
     if result and getattr(result, "message_id", None):
         track_message(chat_id, result.message_id)
     return result
+
+
 Bot.send_message = _tracked_send_message
 dp.message.outer_middleware(TrackingMiddleware())
 
@@ -294,39 +405,19 @@ def cancel_user_search(user_id):
     SEARCH_TASKS.pop(uid, None)
 
 
-async def start_place_search(message, query, user_id, budget="any"):
-    uid = str(user_id)
-    cancel_user_search(uid)
-    async def runner():
-        current = asyncio.current_task()
-        try:
-            await run_place_search(message, query, user_id, budget)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logging.exception("Unhandled place-search error")
-            try:
-                await message.answer("⚠️ Во время поиска произошла ошибка. Попробуй ещё раз.")
-            except Exception:
-                pass
-        finally:
-            if SEARCH_TASKS.get(uid) is current:
-                SEARCH_TASKS.pop(uid, None)
-    task = asyncio.create_task(runner())
-    SEARCH_TASKS[uid] = task
-
-
 async def clear_chat(bot, chat_id):
     try:
         with db() as conn:
-            ids = conn.execute("SELECT message_id FROM chat_messages WHERE chat_id=? ORDER BY message_id DESC", (str(chat_id),)).fetchall()
+            ids = conn.execute(
+                "SELECT message_id FROM chat_messages WHERE chat_id=? ORDER BY message_id DESC",
+                (str(chat_id),)
+            ).fetchall()
     except sqlite3.Error:
         ids = []
-    deleted = failed = 0
+    failed = 0
     for (mid,) in ids:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=int(mid))
-            deleted += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.04)
@@ -336,7 +427,7 @@ async def clear_chat(bot, chat_id):
             conn.commit()
     except sqlite3.Error:
         logging.exception("Could not reset message tracking")
-    return deleted, failed
+    return len(ids) - failed, failed
 
 
 async def search_kakao(query):
@@ -348,7 +439,9 @@ async def search_kakao(query):
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
             for page in range(1, 4):
-                async with session.get(url, headers=headers, params={"query": query, "size": 15, "page": page}) as resp:
+                async with session.get(
+                    url, headers=headers, params={"query": query, "size": 15, "page": page}
+                ) as resp:
                     if resp.status == 401:
                         return None, "Kakao не принял ключ API. Проверь KAKAO_REST_API_KEY."
                     if resp.status == 403:
@@ -357,10 +450,11 @@ async def search_kakao(query):
                         logging.error("Kakao HTTP %s", resp.status)
                         return None, f"Ошибка поиска Kakao: HTTP {resp.status}."
                     data = await resp.json()
-                for p in data.get("documents", []):
-                    pid = str(p.get("id", "")) or (p.get("place_name"), p.get("address_name"))
+                for place in data.get("documents", []):
+                    pid = str(place.get("id", "")) or (place.get("place_name"), place.get("address_name"))
                     if pid not in seen:
-                        seen.add(pid); results.append(p)
+                        seen.add(pid)
+                        results.append(place)
                 if not data.get("documents") or data.get("meta", {}).get("is_end", True):
                     break
         return results, None
@@ -376,7 +470,10 @@ async def search_kakao(query):
 def get_review_summary(place_id):
     try:
         with db() as conn:
-            rows = conn.execute("SELECT dimension,AVG(score),COUNT(*) FROM reviews WHERE place_id=? GROUP BY dimension", (str(place_id),)).fetchall()
+            rows = conn.execute(
+                "SELECT dimension,AVG(score),COUNT(*) FROM reviews WHERE place_id=? GROUP BY dimension",
+                (str(place_id),)
+            ).fetchall()
         return {r[0]: (float(r[1]), int(r[2])) for r in rows}
     except sqlite3.Error:
         logging.exception("Could not read reviews")
@@ -396,17 +493,30 @@ def rating_dimensions_for_place(place):
 
 def review_keyboard(place_id, place):
     dims = rating_dimensions_for_place(place)
-    rows = [[InlineKeyboardButton(text=f"⭐ {label}", callback_data=f"rate:{place_id}:{key}") for key, label in dims[i:i+2]] for i in range(0, len(dims), 2)]
+    rows = [[InlineKeyboardButton(text=f"⭐ {label}", callback_data=f"rate:{place_id}:{key}")
+             for key, label in dims[i:i+2]] for i in range(0, len(dims), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def score_keyboard(place_id, dimension):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{n} ⭐", callback_data=f"score:{place_id}:{dimension}:{n}") for n in range(1, 6)], [InlineKeyboardButton(text="↩️ Отмена", callback_data="rate:cancel:cancel")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n} ⭐", callback_data=f"score:{place_id}:{dimension}:{n}")
+         for n in range(1, 6)],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="rate:cancel:cancel")]
+    ])
 
 
 def describe_category(place):
     cat = (place.get("category_name", "") + " " + place.get("category_group_name", "")).lower()
-    pairs = [("pc방", "Компьютерный клуб"), ("찜질방", "Корейская баня / ччимчильбан"), ("사우나", "Сауна"), ("스파", "СПА"), ("렌터카", "Аренда автомобилей"), ("부동산", "Недвижимость"), ("장난감", "Игрушки"), ("병원", "Медицина"), ("의원", "Клиника"), ("치과", "Стоматология"), ("약국", "Аптека"), ("카페", "Кафе"), ("음식점", "Ресторан"), ("마트", "Магазин / супермаркет"), ("호텔", "Отель"), ("미용실", "Салон красоты"), ("동물병원", "Ветеринар"), ("자동차", "Автомобильные услуги"), ("관광", "Достопримечательность")]
+    pairs = [
+        ("pc방", "Компьютерный клуб"), ("찜질방", "Корейская баня / ччимчильбан"),
+        ("사우나", "Сауна"), ("스파", "СПА"), ("렌터카", "Аренда автомобилей"),
+        ("부동산", "Недвижимость"), ("장난감", "Игрушки"), ("병원", "Медицина"),
+        ("의원", "Клиника"), ("치과", "Стоматология"), ("약국", "Аптека"),
+        ("카페", "Кафе"), ("음식점", "Ресторан"), ("마트", "Магазин / супермаркет"),
+        ("호텔", "Отель"), ("미용실", "Салон красоты"), ("동물병원", "Ветеринар"),
+        ("자동차", "Автомобильные услуги"), ("관광", "Достопримечательность")
+    ]
     for key, label in pairs:
         if key in cat:
             return label
@@ -414,31 +524,45 @@ def describe_category(place):
 
 
 def price_label(pref):
-    return {"cheap": "самый дешёвый вариант", "mid": "средний бюджет", "premium": "дорогой / премиум", "any": "любой бюджет"}.get(pref, "не указан")
+    return {"cheap": "самый дешёвый вариант", "mid": "средний бюджет",
+            "premium": "дорогой / премиум", "any": "любой бюджет"}.get(pref, "не указан")
 
 
 def budget_search_terms(query, pref):
     q, city, ko = normalize(query), find_city(query) or "", translate_query(query)
     if pref == "cheap":
-        if any(x in q for x in ("игруш", "toy")): return [f"저렴한 장난감 가게 {city}".strip(), f"장난감 가게 {city}".strip()]
-        if any(x in q for x in ("аренд", "прокат", "машин", "авто", "rent", "car")): return [f"저렴한 렌터카 {city}".strip(), f"렌터카 {city}".strip()]
+        if any(x in q for x in ("игруш", "toy")):
+            return [f"저렴한 장난감 가게 {city}".strip(), f"장난감 가게 {city}".strip()]
+        if any(x in q for x in ("аренд", "прокат", "машин", "авто", "rent", "car")):
+            return [f"저렴한 렌터카 {city}".strip(), f"렌터카 {city}".strip()]
     if pref == "premium":
-        if any(x in q for x in ("игруш", "toy")): return [f"고급 장난감 매장 {city}".strip(), f"장난감 가게 {city}".strip()]
-        if any(x in q for x in ("аренд", "прокат", "машин", "авто", "rent", "car")): return [f"고급 렌터카 {city}".strip(), f"렌터카 {city}".strip()]
+        if any(x in q for x in ("игруш", "toy")):
+            return [f"고급 장난감 매장 {city}".strip(), f"장난감 가게 {city}".strip()]
+        if any(x in q for x in ("аренд", "прокат", "машин", "авто", "rent", "car")):
+            return [f"고급 렌터카 {city}".strip(), f"렌터카 {city}".strip()]
     return [ko]
 
 
 def build_search_queries(query, budget):
     city, qnorm = find_city(query) or "", normalize(query)
-    if any(w in qnorm for w in ("응급", "скорая", "неотлож", "экстренн")): terms = EMERGENCY_QUERIES[:3]
-    elif any(w in qnorm for w in ("медицин", "больниц", "клиник", "аптек", "стомат", "врач", "병원", "의원")): terms = MEDICAL_QUERIES[:8]
-    elif any(w in qnorm for w in ("кафе", "кофейн", "ресторан", "음식점", "카페")): terms = ["카페", "음식점", "식당"]
-    elif any(w in qnorm for w in ("автосервис", "автозапчаст", "запчаст", "авто и запчасти", "자동차 정비", "자동차 부품")): terms = ["자동차 정비소", "자동차 수리", "자동차 부품"]
-    elif any(w in qnorm for w in ("магазин", "магазины", "супермаркет", "마트")): terms = ["마트", "매장", "슈퍼마켓"]
-    elif any(w in qnorm for w in ("отель", "гостиниц", "호텔")): terms = ["호텔", "모텔", "게스트하우스"]
-    elif any(w in qnorm for w in ("салон красоты", "парикмах", "красоты", "미용실")): terms = ["미용실", "헤어샵", "네일샵"]
-    elif any(w in qnorm for w in ("аренд", "прокат", "렌터카")): return list(dict.fromkeys(budget_search_terms(query, budget)))
-    else: return list(dict.fromkeys(q for q in budget_search_terms(query, budget) if q.strip()))
+    if any(w in qnorm for w in ("응급", "скорая", "неотлож", "экстренн")):
+        terms = EMERGENCY_QUERIES[:3]
+    elif any(w in qnorm for w in ("медицин", "больниц", "клиник", "аптек", "стомат", "врач", "병원", "의원")):
+        terms = MEDICAL_QUERIES[:8]
+    elif any(w in qnorm for w in ("кафе", "кофейн", "ресторан", "음식점", "카페")):
+        terms = ["카페", "음식점", "식당"]
+    elif any(w in qnorm for w in ("автосервис", "автозапчаст", "запчаст", "авто и запчасти", "자동차 정비", "자동차 부품")):
+        terms = ["자동차 정비소", "자동차 수리", "자동차 부품"]
+    elif any(w in qnorm for w in ("магазин", "магазины", "супермаркет", "마트")):
+        terms = ["마트", "매장", "슈퍼마켓"]
+    elif any(w in qnorm for w in ("отель", "гостиниц", "호텔")):
+        terms = ["호텔", "모텔", "게스트하우스"]
+    elif any(w in qnorm for w in ("салон красоты", "парикмах", "красоты", "미용실")):
+        terms = ["미용실", "헤어샵", "네일샵"]
+    elif any(w in qnorm for w in ("аренд", "прокат", "렌터카")):
+        return list(dict.fromkeys(budget_search_terms(query, budget)))
+    else:
+        terms = budget_search_terms(query, budget)
     return list(dict.fromkeys(f"{term} {city}".strip() for term in terms))
 
 
@@ -459,21 +583,36 @@ async def ask_ai(question, user_id, extra_instructions=""):
     history = CONVERSATION_HISTORY.setdefault(str(user_id), [])
     instructions = AI_INSTRUCTIONS
     memory = get_search_memory_context(user_id)
-    if memory: instructions += "\n\n" + memory
-    if extra_instructions: instructions += "\n\n" + extra_instructions
+    if memory:
+        instructions += "\n\n" + memory
+    if extra_instructions:
+        instructions += "\n\n" + extra_instructions
     payload = {
-        "model": AI_MODEL, "instructions": instructions + "\n\nДля актуальных вопросов используй встроенный веб-поиск, если он доступен. Ищи по нескольким релевантным запросам, предпочитай официальные источники и указывай прямые ссылки. Если поиск не сработал, честно сообщи об этом.",
+        "model": AI_MODEL,
+        "instructions": instructions + "\n\nДля актуальных вопросов используй встроенный веб-поиск, если он доступен. "
+        "Ищи по нескольким релевантным запросам, предпочитай официальные источники и указывай прямые ссылки. "
+        "Если поиск не сработал, честно сообщи об этом.",
         "input": history[-MAX_HISTORY_MESSAGES:] + [{"role": "user", "content": question}],
-        "max_output_tokens": 1800, "store": False, "tools": [{"type": "web_search"}], "tool_choice": "auto"
+        "max_output_tokens": 1800, "store": False,
+        "tools": [{"type": "web_search"}], "tool_choice": "auto"
     }
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=100)) as session:
-            async with session.post("https://api.openai.com/v1/responses", headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}, json=payload) as resp:
+            async with session.post(
+                "https://api.openai.com/v1/responses",
+                headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
+                json=payload
+            ) as resp:
                 if resp.status in (400, 404, 422):
                     body = (await resp.text())[:500]
                     if "web_search" in body or "tool" in body.lower():
-                        payload.pop("tools", None); payload.pop("tool_choice", None)
-                        async with session.post("https://api.openai.com/v1/responses", headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}, json=payload) as retry:
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
+                        async with session.post(
+                            "https://api.openai.com/v1/responses",
+                            headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
+                            json=payload
+                        ) as retry:
                             if retry.status != 200:
                                 logging.error("OpenAI retry HTTP %s: %s", retry.status, (await retry.text())[:300])
                                 return f"Ошибка ИИ-сервиса: HTTP {retry.status}."
@@ -481,58 +620,58 @@ async def ask_ai(question, user_id, extra_instructions=""):
                     else:
                         logging.error("OpenAI HTTP %s: %s", resp.status, body)
                         return f"Ошибка ИИ-сервиса: HTTP {resp.status}."
-                elif resp.status == 401: return "OpenAI не принял API-ключ. Проверь OPENAI_API_KEY в Render."
-                elif resp.status == 429: return "ИИ временно недоступен: проверь лимиты и оплату OpenAI API."
+                elif resp.status == 401:
+                    return "OpenAI не принял API-ключ. Проверь OPENAI_API_KEY в Render."
+                elif resp.status == 429:
+                    return "ИИ временно недоступен: проверь лимиты и оплату OpenAI API."
                 elif resp.status != 200:
                     logging.error("OpenAI HTTP %s: %s", resp.status, (await resp.text())[:300])
                     return f"Ошибка ИИ-сервиса: HTTP {resp.status}."
-                else: data = await resp.json()
-        answer = "\n".join(c.get("text", "") for item in data.get("output", []) if item.get("type") == "message" for c in item.get("content", []) if c.get("type") == "output_text").strip()
-        if not answer: return "ИИ не вернул ответ. Попробуй задать вопрос иначе."
+                else:
+                    data = await resp.json()
+        answer = "\n".join(
+            c.get("text", "") for item in data.get("output", []) if item.get("type") == "message"
+            for c in item.get("content", []) if c.get("type") == "output_text"
+        ).strip()
+        if not answer:
+            return "ИИ не вернул ответ. Попробуй задать вопрос иначе."
         history.extend([{"role": "user", "content": question}, {"role": "assistant", "content": answer}])
         CONVERSATION_HISTORY[str(user_id)] = history[-MAX_HISTORY_MESSAGES:]
         return answer
-    except asyncio.TimeoutError: return "ИИ отвечает слишком долго. Попробуй ещё раз."
+    except asyncio.TimeoutError:
+        return "ИИ отвечает слишком долго. Попробуй ещё раз."
     except aiohttp.ClientError:
         logging.exception("OpenAI request failed")
         return "Не удалось подключиться к ИИ. Попробуй позже."
 
 
 async def ask_jobs_ai(query, user_id):
-    """Searches public job listings via the OpenAI web search tool; never invents missing fields."""
     prompt = (
         "Найди реальные, актуальные публичные вакансии в Южной Корее по запросу пользователя: " + query + ". "
-        "Обязательно используй веб-поиск, если доступен. Ищи не только агентства: проверяй Work24, Saramin, JobKorea, "
-        "Albamon, AlbaCheonguk, EPS и открытые страницы работодателей/сообществ. Найди до 5 конкретных объявлений. "
-        "Не выдавай просто список сайтов вместо найденных объявлений. Для каждой вакансии создай карточку на русском:\n"
-        "💼 ВАКАНСИЯ №\n🏢 Работодатель\n📌 Должность\n📍 Город/район\n💰 Зарплата и единица оплаты\n"
-        "🕒 График/часы\n🧰 Обязанности\n📋 Требования\n🛂 Виза/условия для иностранцев\n🏠 Жильё\n"
-        "☎️ Контакты\n📅 Дата публикации/срок отклика\n🔗 Прямая ссылка на объявление\n📚 Источник.\n"
-        "Правила: каждое поле указывай только если подтверждено страницей; иначе пиши «Не указано в объявлении». "
-        "Не придумывай телефон, зарплату, визу, жильё, дату или ссылку. Отличай объявление работодателя от посредника. "
-        "Укажи, если источник не удалось открыть или актуальность не подтверждена. Отмечай признаки подозрительной вакансии "
-        "(предоплата, обещание гарантированной визы, отсутствие работодателя), но не делай неподтверждённых обвинений. "
-        "Если конкретных объявлений найти не удалось, честно скажи об этом и дай прямые ссылки на поиск по запросу на сайтах. "
-        "Не утверждай, что проверил весь интернет."
+        "Используй веб-поиск, если доступен. Ищи Work24, Saramin, JobKorea, Albamon, AlbaCheonguk, EPS "
+        "и открытые страницы работодателей/сообществ. Найди до 5 конкретных объявлений. "
+        "Для каждой вакансии укажи работодателя, должность, город, зарплату, график, требования, визу, жильё, "
+        "контакты, дату публикации и прямую ссылку. Поля без подтверждения отмечай «Не указано в объявлении». "
+        "Не выдумывай телефон, зарплату, визу, жильё, дату или ссылку. Если конкретных объявлений найти не удалось, "
+        "честно скажи об этом. Не утверждай, что проверил весь интернет."
     )
     return await ask_ai(prompt, user_id, extra_instructions=(
         "РЕЖИМ ПОИСКА ВАКАНСИЙ. Приоритет — конкретные объявления с прямыми ссылками и свежими датами. "
-        "Сначала официальные/крупные сайты и страницы работодателей, затем открытые сообщества. "
-        "Не раскрывай личные данные соискателей; контакты работодателя показывай только если они публично указаны в объявлении."
+        "Не раскрывай личные данные соискателей; контакты работодателя показывай только если они публично указаны."
     ))
 
 
 def job_search_links(query):
     q = quote_plus(query)
     return (
-        "\n\n🔎 Дополнительные поиски по исходному запросу:\n"
-        f"• Work24: https://www.work24.go.kr/\n"
-        f"• Saramin: https://www.saramin.co.kr/\n"
-        f"• JobKorea: https://www.jobkorea.co.kr/\n"
-        f"• Albamon: https://www.albamon.com/\n"
-        f"• AlbaCheonguk: https://www.alba.co.kr/\n"
-        f"• Naver Search: https://search.naver.com/search.naver?query={q}%20%EC%B1%84%EC%9A%A9\n"
-        f"• Google Search: https://www.google.com/search?q={q}+jobs+South+Korea"
+        "\n\n🔎 Дополнительные поиски:\n"
+        "• Work24: https://www.work24.go.kr/\n"
+        "• Saramin: https://www.saramin.co.kr/\n"
+        "• JobKorea: https://www.jobkorea.co.kr/\n"
+        "• Albamon: https://www.albamon.com/\n"
+        "• AlbaCheonguk: https://www.alba.co.kr/\n"
+        f"• Naver: https://search.naver.com/search.naver?query={q}%20%EC%B1%84%EC%9A%A9\n"
+        f"• Google: https://www.google.com/search?q={q}+jobs+South+Korea"
     )
 
 
@@ -541,237 +680,731 @@ async def send_long(message, text):
         await message.answer(text[i:i+3500], disable_web_page_preview=True)
 
 
+def place_list_keyboard(user_id, places):
+    uid = str(user_id)
+    cache = PLACE_RESULTS.setdefault(uid, {})
+    cache.clear()
+    rows = []
+    for idx, place in enumerate(places[:MAX_PLACE_RESULTS_PER_USER]):
+        key = str(idx)
+        cache[key] = place
+        name = (place.get("place_name") or "Название не указано").strip()
+        # Telegram button text should be concise.
+        if len(name) > 48:
+            name = name[:45] + "…"
+        rows.append([InlineKeyboardButton(text=f"📍 {name}", callback_data=f"place:{key}")])
+    rows.append([InlineKeyboardButton(text="🔄 Новый поиск", callback_data="places:new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def place_detail_text(place):
+    pid = str(place.get("id", ""))
+    summary = get_review_summary(pid) if pid else {}
+    overall = summary.get("overall")
+    address = place.get("road_address_name") or place.get("address_name") or "Адрес не указан в источнике"
+    phone = place.get("phone") or "Телефон не указан в источнике"
+    lines = [
+        "🇰🇷 TRUSTMAP KOREA",
+        "",
+        f"🏢 {place.get('place_name', 'Название не указано')}",
+        f"🏷️ {describe_category(place)}",
+        f"📍 Адрес: {address}",
+        f"☎️ Телефон: {phone}",
+    ]
+    if place.get("place_url"):
+        lines.append(f"🗺️ Карта: {place['place_url']}")
+    if overall:
+        lines.append(f"💙 Оценка TrustMap: {overall[0]:.1f}/5 на основе {overall[1]} оценок")
+    else:
+        lines.append("💙 Оценка TrustMap: пока нет пользовательских оценок")
+    for dim, (avg, count) in summary.items():
+        if dim != "overall":
+            lines.append(f"  • {RATING_DIMENSIONS.get(dim, dim)}: {avg:.1f}/5 ({count})")
+    lines += [
+        "",
+        "ℹ️ Данные о месте получены из Kakao. Цены и часы работы могут отсутствовать или меняться.",
+        "Выбери показатель ниже, чтобы оставить оценку."
+    ]
+    return "\n".join(lines)
+
+
+async def start_place_search(message, query, user_id, budget="any"):
+    uid = str(user_id)
+    cancel_user_search(uid)
+
+    async def runner():
+        current = asyncio.current_task()
+        try:
+            await run_place_search(message, query, user_id, budget)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("Unhandled place-search error")
+            try:
+                await message.answer("⚠️ Во время поиска произошла ошибка. Попробуй ещё раз.")
+            except Exception:
+                pass
+        finally:
+            if SEARCH_TASKS.get(uid) is current:
+                SEARCH_TASKS.pop(uid, None)
+
+    task = asyncio.create_task(runner())
+    SEARCH_TASKS[uid] = task
+
+
 async def run_place_search(message, query, user_id, budget="any"):
-    city_ko = find_city(query); search_queries = build_search_queries(query, budget)
-    await message.answer("🔎 Ищу места...")
+    city_ko = find_city(query)
+    search_queries = build_search_queries(query, budget)
+    await message.answer("⏳ Обрабатывается запрос…")
     places, seen, used = [], set(), []
     current_task = asyncio.current_task()
     for search_query in search_queries:
-        if current_task and current_task.cancelling(): raise asyncio.CancelledError
+        if current_task and current_task.cancelling():
+            raise asyncio.CancelledError
         found, error = await search_kakao(search_query)
-        if current_task and current_task.cancelling(): raise asyncio.CancelledError
+        if current_task and current_task.cancelling():
+            raise asyncio.CancelledError
         if error:
-            await message.answer(error); return
+            await message.answer(error)
+            return
         used.append(search_query)
-        for p in found or []:
-            pid = str(p.get("id", "")) or (p.get("place_name"), p.get("address_name"))
-            if pid not in seen: seen.add(pid); places.append(p)
-        if len(places) >= 30: break
+        for place in found or []:
+            pid = str(place.get("id", "")) or (place.get("place_name"), place.get("address_name"))
+            if pid not in seen:
+                seen.add(pid)
+                places.append(place)
+        if len(places) >= MAX_PLACE_RESULTS_PER_USER:
+            break
     save_search_memory(user_id, query, " | ".join(used), places)
     if not places:
         location = CITY_LABELS.get(city_ko, city_ko) if city_ko else "Южной Корее"
-        await message.answer(f"😔 По запросу «{query}» в {location} Kakao не вернул результатов.\nЭто не означает, что таких мест нет: попробуй более короткий запрос или другой город.", reply_markup=make_keyboard())
+        await message.answer(
+            f"😔 По запросу «{query}» в {location} Kakao не вернул результатов.\n"
+            "Это не означает, что таких мест нет: попробуй более короткий запрос или другой город.",
+            reply_markup=make_keyboard()
+        )
         return
-    for i, p in enumerate(places[:30], 1):
-        if current_task and current_task.cancelling(): raise asyncio.CancelledError
-        pid = str(p.get("id", "")); summary = get_review_summary(pid) if pid else {}; overall = summary.get("overall")
-        caption = f"🇰🇷 TRUSTMAP KOREA · МЕСТО №{i}\n\n🏢 {p.get('place_name', 'Название не указано')}\n🏷️ {describe_category(p)}\n📍 {p.get('road_address_name') or p.get('address_name') or 'Адрес не указан'}\n☎️ {p.get('phone') or 'Телефон не указан'}\n"
-        if p.get("place_url"): caption += f"🗺️ Карта: {p['place_url']}\n"
-        caption += f"💙 Общая оценка TrustMap: {overall[0]:.1f}/5 · {overall[1]} оценок\n" if overall else "💙 Общая оценка TrustMap: пока нет оценок\n"
-        for dim, (avg, count) in summary.items():
-            if dim != "overall": caption += f"  • {RATING_DIMENSIONS.get(dim, dim)}: {avg:.1f}/5 ({count})\n"
-        caption += f"\n💰 Предпочтение по цене: {price_label(budget)}.\nℹ️ Цена не подтверждена Kakao; уточни её у заведения."
-        await message.answer(caption, reply_markup=review_keyboard(pid, p) if pid else None, disable_web_page_preview=True)
-    await message.answer("💙 Средние оценки TrustMap общие для всех пользователей. Каждый пользователь может изменить свою оценку.", reply_markup=make_keyboard())
+    PLACE_RESULTS[str(user_id)] = {}
+    keyboard = place_list_keyboard(user_id, places)
+    await message.answer(
+        f"🇰🇷 TRUSTMAP KOREA\n\n"
+        f"🔎 Найдено мест: {min(len(places), MAX_PLACE_RESULTS_PER_USER)}\n"
+        f"Запрос: {query}\n\n"
+        "Выбери место из списка, чтобы открыть адрес, телефон и оценки:",
+        reply_markup=keyboard,
+        disable_web_page_preview=True
+    )
 
 
-FEEDBACK_LABELS = {"like": "Что нравится", "dislike": "Что не нравится", "idea": "Идея / предложение", "bug": "Ошибка в боте"}
+FEEDBACK_LABELS = {
+    "like": "Что нравится", "dislike": "Что не нравится",
+    "idea": "Идея / предложение", "bug": "Ошибка в боте"
+}
+
+
 def feedback_kind_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="😍 Что нравится", callback_data="feedback:like")], [InlineKeyboardButton(text="🙁 Что не нравится", callback_data="feedback:dislike")], [InlineKeyboardButton(text="💡 Идея / предложение", callback_data="feedback:idea")], [InlineKeyboardButton(text="🐞 Ошибка в боте", callback_data="feedback:bug")], [InlineKeyboardButton(text="❌ Отмена", callback_data="feedback:cancel")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😍 Что нравится", callback_data="feedback:like")],
+        [InlineKeyboardButton(text="🙁 Что не нравится", callback_data="feedback:dislike")],
+        [InlineKeyboardButton(text="💡 Идея / предложение", callback_data="feedback:idea")],
+        [InlineKeyboardButton(text="🐞 Ошибка в боте", callback_data="feedback:bug")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="feedback:cancel")]
+    ])
+
+
+@dp.callback_query(F.data == "places:new")
+async def new_places_search_callback(callback: CallbackQuery):
+    USER_FLOWS.pop(str(callback.from_user.id), None)
+    await callback.message.answer("Напиши, что ищем и в каком городе. Например: «кафе в Чхонане».")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("place:"))
+async def place_detail_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    key = (callback.data or "").split(":", 1)[1]
+    place = PLACE_RESULTS.get(uid, {}).get(key)
+    if not place:
+        await callback.answer("Этот список устарел. Запусти поиск заново.", show_alert=True)
+        return
+    pid = str(place.get("id", ""))
+    keyboard = review_keyboard(pid, place) if pid else None
+    await callback.message.answer(place_detail_text(place), reply_markup=keyboard, disable_web_page_preview=True)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("feedback:"))
 async def feedback_callback(callback: CallbackQuery):
-    user_id = str(callback.from_user.id); choice = (callback.data or "").split(":", 1)[1]
+    user_id = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
     if choice == "cancel":
-        USER_FLOWS.pop(user_id, None); await callback.message.edit_reply_markup(reply_markup=None); await callback.answer("Отменено"); return
+        USER_FLOWS.pop(user_id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Отменено")
+        return
     if choice not in FEEDBACK_LABELS:
-        await callback.answer("Неизвестный вариант.", show_alert=True); return
+        await callback.answer("Неизвестный вариант.", show_alert=True)
+        return
     USER_FLOWS[user_id] = {"kind": "feedback", "stage": "message", "values": {"type": choice}}
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"✍️ Напиши одним сообщением: {FEEDBACK_LABELS[choice].lower()}. Можно подробно. Не отправляй пароли, номера документов или банковские данные.")
+    await callback.message.answer(
+        f"✍️ Напиши одним сообщением: {FEEDBACK_LABELS[choice].lower()}. Можно подробно. "
+        "Не отправляй пароли, номера документов или банковские данные."
+    )
     await callback.answer()
 
 
 @dp.message(Command("myid"))
 async def my_id_command(message: Message):
-    await message.answer(f"Твой Telegram ID: {message.from_user.id}\nЧтобы получать отзывы в личный Telegram, добавь это число в Render как переменную ADMIN_TELEGRAM_ID.")
+    await message.answer(
+        f"Твой Telegram ID: {message.from_user.id}\n"
+        "Чтобы получать отзывы в личный Telegram, добавь это число в Render как переменную ADMIN_TELEGRAM_ID."
+    )
 
 
 @dp.message(Command("feedbacks"))
 async def owner_feedbacks(message: Message):
     if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
-        await message.answer("Эта команда доступна только администратору бота."); return
+        await message.answer("Эта команда доступна только администратору бота.")
+        return
     try:
         with db() as conn:
-            rows = conn.execute("SELECT id,user_id,username,feedback_type,message,created_at FROM bot_feedback ORDER BY id DESC LIMIT 30").fetchall()
+            rows = conn.execute(
+                "SELECT id,user_id,username,feedback_type,message,created_at FROM bot_feedback "
+                "ORDER BY id DESC LIMIT 30"
+            ).fetchall()
     except sqlite3.Error:
-        logging.exception("Could not read bot feedback"); await message.answer("Не удалось прочитать отзывы из базы данных."); return
-    if not rows: await message.answer("Пока отзывов о боте нет."); return
-    current = "💬 ПОСЛЕДНИЕ ОТЗЫВЫ TRUSTMAP KOREA\n\n"; chunks = []
+        logging.exception("Could not read bot feedback")
+        await message.answer("Не удалось прочитать отзывы из базы данных.")
+        return
+    if not rows:
+        await message.answer("Пока отзывов о боте нет.")
+        return
+    current, chunks = "💬 ПОСЛЕДНИЕ ОТЗЫВЫ TRUSTMAP KOREA\n\n", []
     for rid, uid, username, kind, body, created in rows:
-        item = f"#{rid} · {created}\nТип: {FEEDBACK_LABELS.get(kind,kind)}\nПользователь: @{username or 'не указан'} (ID {uid})\n{body}\n\n━━━━━━━━━━━━\n\n"
-        if len(current) + len(item) > 3500: chunks.append(current); current = ""
+        item = (
+            f"#{rid} · {created}\nТип: {FEEDBACK_LABELS.get(kind, kind)}\n"
+            f"Пользователь: @{username or 'не указан'} (ID {uid})\n{body}\n\n━━━━━━━━━━━━\n\n"
+        )
+        if len(current) + len(item) > 3500:
+            chunks.append(current)
+            current = ""
         current += item
-    if current: chunks.append(current)
-    for chunk in chunks: await message.answer(chunk)
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 @dp.message(Command("clear"))
 async def clear_command(message: Message):
-    uid = str(message.from_user.id); cancel_user_search(uid); CONVERSATION_HISTORY.pop(uid, None); USER_FLOWS.pop(uid, None)
+    uid = str(message.from_user.id)
+    cancel_user_search(uid)
+    CONVERSATION_HISTORY.pop(uid, None)
+    USER_FLOWS.pop(uid, None)
+    PLACE_RESULTS.pop(uid, None)
     deleted, failed = await clear_chat(message.bot, message.chat.id)
     notice = "🧹 Чат очищен. Начнём заново."
-    if failed: notice += f"\nНекоторые сообщения Telegram не разрешил удалить ({failed})."
+    if failed:
+        notice += f"\nНекоторые сообщения Telegram не разрешил удалить ({failed})."
     notice += "\nОценки мест, отзывы о боте и сохранённые поиски не удалены."
     await message.answer(notice, reply_markup=make_keyboard())
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    cancel_user_search(message.from_user.id); USER_FLOWS.pop(str(message.from_user.id), None)
-    await message.answer("🇰🇷 TRUSTMAP KOREA\n\nПомощник для жизни в Южной Корее.\nИщи места, работу, магазины игрушек, аренду авто, медицину, жильё и услуги.\nМожно искать в конкретном городе или по Корее.\nОценки пользователей объединяются в общий рейтинг.\n\nПримеры: «нужны недорогие игрушки в Чхонане» или «ищу работу на складе в Чхонане, зарплата от 3 млн вон».\n\nДля поиска вакансий указывай город, вид работы, желаемую зарплату, график и условия визы — если они важны.", reply_markup=make_keyboard())
+    cancel_user_search(message.from_user.id)
+    USER_FLOWS.pop(str(message.from_user.id), None)
+    await message.answer(
+        "🇰🇷 TRUSTMAP KOREA\n\n"
+        "Помощник для жизни в Южной Корее.\n"
+        "Ищи места, работу, магазины игрушек, аренду авто, медицину, жильё и услуги.\n"
+        "Можно искать в конкретном городе или по Корее.\n"
+        "Оценки пользователей объединяются в общий рейтинг.\n\n"
+        "Примеры: «нужны недорогие игрушки в Чхонане» или "
+        "«ищу работу на складе в Чхонане, зарплата от 3 млн вон».",
+        reply_markup=make_keyboard()
+    )
 
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
     cancel_user_search(message.from_user.id)
-    await message.answer("Примеры запросов:\n• кафе в Чхонане\n• недорогие игрушки в Сеуле\n• аренда машины в Пусане\n• аптека в Инчхоне\n• больница в Чхонане\n• работа на складе в Чхонане с жильём\n• /ai Как сказать спасибо по-корейски?\n\nДля экстренной помощи в Корее звони 119. Оценки TrustMap — оценки пользователей, не официальный рейтинг.", reply_markup=make_keyboard())
+    await message.answer(
+        "Примеры запросов:\n• кафе в Чхонане\n• недорогие игрушки в Сеуле\n"
+        "• аренда машины в Пусане\n• аптека в Инчхоне\n• больница в Чхонане\n"
+        "• работа на складе в Чхонане с жильём\n"
+        "• /ai Как сказать спасибо по-корейски?\n\n"
+        "Для экстренной помощи в Корее звони 119. Оценки TrustMap — оценки пользователей, не официальный рейтинг.",
+        reply_markup=make_keyboard()
+    )
 
 
 @dp.message(Command("ai"))
 async def ai_command(message: Message):
-    cancel_user_search(message.from_user.id); USER_FLOWS.pop(str(message.from_user.id), None)
+    cancel_user_search(message.from_user.id)
+    USER_FLOWS.pop(str(message.from_user.id), None)
     question = (message.text or "").partition(" ")[2].strip()
-    if not question: await message.answer("Напиши вопрос после /ai."); return
-    await message.answer("🤖 ИИ ищет информацию и готовит ответ…")
+    if not question:
+        await message.answer("Напиши вопрос после /ai.")
+        return
+    await message.answer("⏳ Обрабатывается запрос…")
     await send_long(message, await ask_ai(question, message.from_user.id))
 
 
 @dp.callback_query(F.data.startswith("budget:"))
 async def budget_callback(callback: CallbackQuery):
-    user_id = str(callback.from_user.id); cancel_user_search(user_id); flow = USER_FLOWS.get(user_id)
+    user_id = str(callback.from_user.id)
+    cancel_user_search(user_id)
+    flow = USER_FLOWS.get(user_id)
     if not flow or flow.get("kind") != "search" or flow.get("stage") != "budget":
-        await callback.answer("Этот выбор уже не активен. Начни поиск заново.", show_alert=True); return
-    pref = (callback.data or "").split(":", 1)[1]; flow["values"]["budget"] = pref; flow["stage"] = "city"
-    await callback.message.edit_reply_markup(reply_markup=None); await callback.message.answer("📍 Выбери город или поиск по Корее:", reply_markup=city_keyboard()); await callback.answer("Предпочтение сохранено")
+        await callback.answer("Этот выбор уже не активен. Начни поиск заново.", show_alert=True)
+        return
+    pref = (callback.data or "").split(":", 1)[1]
+    flow["values"]["budget"] = pref
+    flow["stage"] = "city"
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("📍 Выбери город или поиск по Корее:", reply_markup=city_keyboard())
+    await callback.answer("Предпочтение сохранено")
 
 
 @dp.callback_query(F.data.startswith("city:"))
 async def city_callback(callback: CallbackQuery):
-    user_id = str(callback.from_user.id); cancel_user_search(user_id); choice = (callback.data or "").split(":", 1)[1]; flow = USER_FLOWS.get(user_id)
+    user_id = str(callback.from_user.id)
+    cancel_user_search(user_id)
+    choice = (callback.data or "").split(":", 1)[1]
+    flow = USER_FLOWS.get(user_id)
     if choice == "cancel":
-        USER_FLOWS.pop(user_id, None); await callback.message.edit_reply_markup(reply_markup=None); await callback.answer("Поиск отменён"); return
+        USER_FLOWS.pop(user_id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск отменён")
+        return
     if choice == "other":
-        if flow: flow["allow_custom_city"] = True
-        await callback.message.answer("✍️ Напиши город сообщением (например, Чхонан или Сеул)."); await callback.answer(); return
+        if flow:
+            flow["allow_custom_city"] = True
+        await callback.message.answer("✍️ Напиши город сообщением (например, Чхонан или Сеул).")
+        await callback.answer()
+        return
     if choice == "nationwide":
-        if not flow: await callback.answer("Сначала выбери категорию или напиши запрос.", show_alert=True); return
-        query = flow.get("values", {}).get("query", ""); budget = flow.get("values", {}).get("budget", "any"); USER_FLOWS.pop(user_id, None)
-        await callback.message.edit_reply_markup(reply_markup=None); await callback.answer("Поиск по Корее"); await start_place_search(callback.message, query, user_id, budget); return
+        if not flow:
+            await callback.answer("Сначала выбери категорию или напиши запрос.", show_alert=True)
+            return
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск по Корее")
+        if flow.get("kind") == "housing":
+            await begin_housing_city(callback.message, user_id, "전국")
+            return
+        query = flow.get("values", {}).get("query", "")
+        budget = flow.get("values", {}).get("budget", "any")
+        USER_FLOWS.pop(user_id, None)
+        await start_place_search(callback.message, query, user_id, budget)
+        return
     city_ko = CITY_CALLBACKS.get(choice)
-    if not city_ko: await callback.answer("Не удалось определить город.", show_alert=True); return
-    if not flow or flow.get("stage") != "city": await callback.answer("Этот выбор города уже не активен. Напиши запрос заново.", show_alert=True); return
-    query = flow.get("values", {}).get("query", ""); budget = flow.get("values", {}).get("budget", "any"); USER_FLOWS.pop(user_id, None)
-    await callback.message.edit_reply_markup(reply_markup=None); await callback.answer(f"Город: {CITY_LABELS.get(city_ko, city_ko)}"); await start_place_search(callback.message, f"{query} {city_ko}", user_id, budget)
+    if not city_ko:
+        await callback.answer("Не удалось определить город.", show_alert=True)
+        return
+    if not flow or flow.get("stage") != "city":
+        await callback.answer("Этот выбор города уже не активен. Напиши запрос заново.", show_alert=True)
+        return
+    if flow.get("kind") == "housing":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer(f"Город: {CITY_LABELS.get(city_ko, city_ko)}")
+        await begin_housing_city(callback.message, user_id, city_ko)
+        return
+    query = flow.get("values", {}).get("query", "")
+    budget = flow.get("values", {}).get("budget", "any")
+    USER_FLOWS.pop(user_id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer(f"Город: {CITY_LABELS.get(city_ko, city_ko)}")
+    await start_place_search(callback.message, f"{query} {city_ko}", user_id, budget)
+
+
+@dp.callback_query(F.data.startswith("deal:"))
+async def housing_deal_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
+    flow = USER_FLOWS.get(uid)
+    key = f"deal:{choice}"
+    if not flow or flow.get("kind") != "housing" or flow.get("stage") != "deal" or key not in HOUSING_DEALS:
+        await callback.answer("Этот выбор уже не активен. Начни поиск жилья заново.", show_alert=True)
+        return
+    label, deal = HOUSING_DEALS[key]
+    flow["values"]["deal_label"] = label
+    flow["values"]["deal"] = deal
+    flow["stage"] = "city"
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("📍 В каком городе искать жильё?", reply_markup=city_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("housing:"))
+async def housing_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    raw_choice = callback.data or ""
+    choice = raw_choice.split(":", 1)[1]
+    flow = USER_FLOWS.get(uid)
+    if choice == "cancel":
+        USER_FLOWS.pop(uid, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск жилья отменён")
+        return
+    if not flow or flow.get("kind") != "housing":
+        await callback.answer("Начни поиск жилья заново.", show_alert=True)
+        return
+    if raw_choice in HOUSING_TYPES:
+        label, korean = HOUSING_TYPES[raw_choice]
+        flow["values"]["housing_type"] = label
+        flow["values"]["housing_korean"] = korean
+        flow["stage"] = "deal"
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("🏠 Какой вариант жилья интересует?", reply_markup=housing_deal_keyboard())
+        await callback.answer()
+        return
+    await callback.answer("Неизвестный выбор.", show_alert=True)
+
+
+async def begin_housing_city(message, uid, city):
+    flow = USER_FLOWS.get(uid)
+    if not flow or flow.get("kind") != "housing":
+        return False
+    flow["values"]["city"] = city
+    deal = flow["values"].get("deal", "monthly")
+    if deal == "monthly":
+        flow["stage"] = "monthlyprice"
+        await message.answer("💸 Какую ежемесячную оплату 월세 рассматриваешь?", reply_markup=housing_price_keyboard("monthly"))
+    elif deal == "jeonse":
+        flow["stage"] = "deposit"
+        await message.answer("💰 Какой залог 보증금 / сумма 전세 подходит?", reply_markup=housing_price_keyboard("deposit"))
+    elif deal == "sale":
+        flow["stage"] = "saleprice"
+        await message.answer("💰 Напиши максимальную цену покупки в вонах, например 200000000, или «любой бюджет».")
+    else:
+        flow["stage"] = "monthlyprice"
+        await message.answer("💸 Выбери ежемесячную оплату 월세 или любой бюджет:", reply_markup=housing_price_keyboard("monthly"))
+    return True
+
+
+async def finish_housing_search(message, uid):
+    flow = USER_FLOWS.get(uid)
+    if not flow:
+        return
+    values = flow.get("values", {})
+    city = values.get("city", "")
+    deal = values.get("deal", "monthly")
+    htype = values.get("housing_korean", "부동산")
+    city_label = CITY_LABELS.get(city, city)
+    if deal == "monthly":
+        monthly = values.get("monthly_max")
+        deposit = values.get("deposit_max")
+        query = f"{city_label} {htype} 월세"
+        if monthly is not None:
+            query += f" 월세 {monthly}원 이하"
+        if deposit is not None:
+            query += f" 보증금 {deposit}원 이하"
+    elif deal == "jeonse":
+        query = f"{city_label} {htype} 전세"
+        if values.get("deposit_max") is not None:
+            query += f" 전세 {values['deposit_max']}원 이하"
+    elif deal == "sale":
+        query = f"{city_label} {htype} 매매"
+        if values.get("sale_max") is not None:
+            query += f" {values['sale_max']}원 이하"
+    else:
+        query = f"{city_label} {htype} 부동산"
+    query += " 부동산 중개업소"
+    USER_FLOWS.pop(uid, None)
+    # Kakao returns agencies/places, not a verified database of active listings.
+    await message.answer(
+        "⏳ Обрабатывается запрос…\n"
+        "Ищу агентства и доступные публичные результаты. Активные объявления частных владельцев "
+        "будут доступны только там, где сайт открывает их без закрытого API или авторизации."
+    )
+    await search_housing_sources(message, query, uid, values)
+
+
+async def search_housing_sources(message, query, user_id, values):
+    # Search public web pages through OpenAI web search where available, then show Kakao agencies.
+    # Kakao Local API itself does not provide rental-listing inventory.
+    if OPENAI_KEY:
+        prompt = (
+            "Найди публично доступные объявления о жилье в Южной Корее по запросу: " + query + ". "
+            "Ищи частные объявления и предложения агентств там, где страницы доступны публично: Naver Real Estate, "
+            "Dabang, Zigbang, Peter Pan, сайты агентств и другие открытые сайты. Не утверждай, что проверил все сайты. "
+            "Не обходи авторизацию, paywall, антибот-защиту или закрытые API. Для каждого найденного объявления укажи "
+            "тип жилья, район, месячную оплату, 보증금/залог, 전세/чонсе или цену покупки, если они реально указаны, "
+            "источник и прямую ссылку. Не выдумывай цены и ссылки. Если актуальные объявления не удалось достоверно "
+            "получить, честно скажи и предложи агентства недвижимости из Kakao."
+        )
+        extra = (
+            f"Параметры пользователя: {json.dumps(values, ensure_ascii=False)}. "
+            "Если результат веб-поиска содержит ссылки на публичные объявления, включи их."
+        )
+        try:
+            web_result = await ask_ai(prompt, user_id, extra)
+            await send_long(message, "🏠 Публичные объявления, найденные через доступный веб-поиск:\n\n" + web_result)
+        except Exception:
+            logging.exception("Housing web search failed")
+    # Also return real estate offices from Kakao Local, displayed as a compact list.
+    found, error = await search_kakao(query)
+    if error:
+        await message.answer(error)
+        return
+    agencies = [p for p in (found or []) if "부동산" in (p.get("category_name", "") + p.get("place_name", ""))]
+    if not agencies:
+        await message.answer(
+            "ℹ️ Kakao не вернул агентства недвижимости по этому запросу. Это не подтверждает отсутствие жилья. "
+            "Попробуй изменить город или параметры."
+        )
+    else:
+        PLACE_RESULTS[str(user_id)] = {}
+        await message.answer(
+            "🏢 Агентства недвижимости из Kakao. Нажми на название, чтобы открыть контакты:",
+            reply_markup=place_list_keyboard(user_id, agencies)
+        )
+    await message.answer("ℹ️ Цены и наличие нужно подтвердить у владельца или агентства.", reply_markup=make_keyboard())
+
+
+@dp.callback_query(F.data.startswith("monthlyprice:"))
+async def monthly_price_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    flow = USER_FLOWS.get(uid)
+    if not flow or flow.get("kind") != "housing" or flow.get("stage") != "monthlyprice":
+        await callback.answer("Этот выбор уже не активен.", show_alert=True)
+        return
+    raw = (callback.data or "").split(":", 1)[1]
+    if raw == "custom":
+        flow["stage"] = "monthly_custom"
+        await callback.message.answer("✍️ Введи максимальную ежемесячную оплату в вонах, например 400000.")
+        await callback.answer()
+        return
+    flow["values"]["monthly_max"] = None if raw == "any" else int(raw)
+    flow["stage"] = "deposit"
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("💰 Какой залог 보증금 подходит?", reply_markup=housing_price_keyboard("deposit"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("deposit:"))
+async def deposit_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    flow = USER_FLOWS.get(uid)
+    if not flow or flow.get("kind") != "housing" or flow.get("stage") != "deposit":
+        await callback.answer("Этот выбор уже не активен.", show_alert=True)
+        return
+    raw = (callback.data or "").split(":", 1)[1]
+    if raw == "custom":
+        flow["stage"] = "deposit_custom"
+        await callback.message.answer("✍️ Введи максимальный залог в вонах, например 5000000.")
+        await callback.answer()
+        return
+    flow["values"]["deposit_max"] = None if raw == "any" else int(raw)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Параметры сохранены")
+    await finish_housing_search(callback.message, uid)
 
 
 @dp.callback_query(F.data.startswith("rate:"))
 async def rating_callback(callback: CallbackQuery):
     parts = (callback.data or "").split(":")
-    if len(parts) != 3: await callback.answer("Некорректная кнопка.", show_alert=True); return
+    if len(parts) != 3:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
     _, pid, dim = parts
-    if pid == "cancel": await callback.message.edit_reply_markup(reply_markup=None); await callback.answer("Отменено"); return
-    if dim not in RATING_DIMENSIONS: await callback.answer("Этот показатель недоступен.", show_alert=True); return
-    await callback.message.answer(f"💙 Оцени: {RATING_DIMENSIONS[dim]}\n1 ⭐ — очень плохо · 2 ⭐ — плохо · 3 ⭐ — нормально · 4 ⭐ — хорошо · 5 ⭐ — отлично", reply_markup=score_keyboard(pid, dim)); await callback.answer()
+    if pid == "cancel":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Отменено")
+        return
+    if dim not in RATING_DIMENSIONS:
+        await callback.answer("Этот показатель недоступен.", show_alert=True)
+        return
+    await callback.message.answer(
+        f"💙 Оцени: {RATING_DIMENSIONS[dim]}\n"
+        "1 ⭐ — очень плохо · 2 ⭐ — плохо · 3 ⭐ — нормально · 4 ⭐ — хорошо · 5 ⭐ — отлично",
+        reply_markup=score_keyboard(pid, dim)
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("score:"))
 async def score_callback(callback: CallbackQuery):
     parts = (callback.data or "").split(":")
-    if len(parts) != 4: await callback.answer("Некорректная оценка.", show_alert=True); return
+    if len(parts) != 4:
+        await callback.answer("Некорректная оценка.", show_alert=True)
+        return
     _, pid, dim, raw_score = parts
-    try: score = int(raw_score)
-    except ValueError: await callback.answer("Некорректная оценка.", show_alert=True); return
-    if dim not in RATING_DIMENSIONS or score not in range(1, 6): await callback.answer("Некорректная оценка.", show_alert=True); return
+    try:
+        score = int(raw_score)
+    except ValueError:
+        await callback.answer("Некорректная оценка.", show_alert=True)
+        return
+    if dim not in RATING_DIMENSIONS or score not in range(1, 6):
+        await callback.answer("Некорректная оценка.", show_alert=True)
+        return
     try:
         with db() as conn:
-            conn.execute("INSERT INTO reviews(place_id,place_name,user_id,dimension,score) VALUES(?,?,?,?,?) ON CONFLICT(place_id,user_id,dimension) DO UPDATE SET score=excluded.score,created_at=CURRENT_TIMESTAMP", (pid, "Место Kakao ID " + pid, str(callback.from_user.id), dim, score)); conn.commit()
-        summary = get_review_summary(pid).get(dim); await callback.message.edit_reply_markup(reply_markup=None)
-        if summary: await callback.message.answer(f"💙 Спасибо! Общая оценка «{RATING_DIMENSIONS[dim]}»: {summary[0]:.1f}/5 на основе {summary[1]} оценок. Этот средний балл виден всем пользователям.")
-        else: await callback.message.answer("💙 Спасибо! Оценка сохранена.")
+            conn.execute(
+                "INSERT INTO reviews(place_id,place_name,user_id,dimension,score) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(place_id,user_id,dimension) DO UPDATE SET score=excluded.score,created_at=CURRENT_TIMESTAMP",
+                (pid, "Место Kakao ID " + pid, str(callback.from_user.id), dim, score)
+            )
+            conn.commit()
+        summary = get_review_summary(pid).get(dim)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        if summary:
+            await callback.message.answer(
+                f"💙 Спасибо! Общая оценка «{RATING_DIMENSIONS[dim]}»: "
+                f"{summary[0]:.1f}/5 на основе {summary[1]} оценок. Этот средний балл виден всем пользователям."
+            )
+        else:
+            await callback.message.answer("💙 Спасибо! Оценка сохранена.")
         await callback.answer("Оценка сохранена")
     except sqlite3.Error:
-        logging.exception("Could not save rating"); await callback.answer("Не удалось сохранить оценку. Попробуй позже.", show_alert=True)
+        logging.exception("Could not save rating")
+        await callback.answer("Не удалось сохранить оценку. Попробуй позже.", show_alert=True)
 
 
 def looks_like_ai(text):
     q = normalize(text)
-    if q.startswith("/ai"): return True
-    if any(q.startswith(s) for s in AI_STARTS): return True
-    if any(s in q for s in AI_PHRASES): return True
+    if q.startswith("/ai"):
+        return True
+    if any(q.startswith(s) for s in AI_STARTS):
+        return True
+    if any(s in q for s in AI_PHRASES):
+        return True
     return "?" in q and any(w in q for w in ("как", "почему", "что", "можно", "how", "why", "what"))
 
 
 @dp.message()
 async def handle_message(message: Message):
     text = (message.text or "").strip()
-    if not text: return
-    uid = str(message.from_user.id); q = normalize(text)
+    if not text:
+        return
+    uid = str(message.from_user.id)
+    q = normalize(text)
     cancel_user_search(uid)
 
     if text == "🧹 Очистить чат":
-        CONVERSATION_HISTORY.pop(uid, None); USER_FLOWS.pop(uid, None); deleted, failed = await clear_chat(message.bot, message.chat.id)
+        CONVERSATION_HISTORY.pop(uid, None)
+        USER_FLOWS.pop(uid, None)
+        PLACE_RESULTS.pop(uid, None)
+        deleted, failed = await clear_chat(message.bot, message.chat.id)
         extra = f"\nTelegram не разрешил удалить {failed} сообщений." if failed else ""
-        await message.answer(f"🧹 Чат очищен. Удалено сообщений: {deleted}.{extra}\nОценки, отзывы о боте и сохранённые поиски не удалены.", reply_markup=make_keyboard()); return
+        await message.answer(
+            f"🧹 Чат очищен. Удалено сообщений: {deleted}.{extra}\n"
+            "Оценки, отзывы о боте и сохранённые поиски не удалены.",
+            reply_markup=make_keyboard()
+        )
+        return
     if text == "🤖 ИИ-помощник":
-        USER_FLOWS.pop(uid, None); await message.answer("🤖 Напиши любой вопрос обычным сообщением. Для актуальной информации я попробую использовать веб-поиск."); return
+        USER_FLOWS.pop(uid, None)
+        await message.answer("Напиши любой вопрос обычным сообщением. Для актуальной информации я попробую использовать веб-поиск.")
+        return
     if text == "🌐 Язык / Language":
-        USER_FLOWS.pop(uid, None); await message.answer("🌐 Пиши по-русски, по-английски или по-корейски. Я отвечу на языке сообщения."); return
+        USER_FLOWS.pop(uid, None)
+        await message.answer("🌐 Пиши по-русски, по-английски или по-корейски. Я отвечу на языке сообщения.")
+        return
     if text == "💬 Отзыв о боте" or q == "/feedback":
         USER_FLOWS[uid] = {"kind": "feedback_select", "stage": "type", "values": {}}
-        await message.answer("💬 Помоги сделать TrustMap Korea лучше. Что хочешь сообщить?", reply_markup=feedback_kind_keyboard()); return
+        await message.answer("💬 Помоги сделать TrustMap Korea лучше. Что хочешь сообщить?", reply_markup=feedback_kind_keyboard())
+        return
 
     flow_now = USER_FLOWS.get(uid)
     if flow_now and flow_now.get("kind") == "feedback" and flow_now.get("stage") == "message":
         body = text.strip()
-        if len(body) < 3: await message.answer("Напиши, пожалуйста, чуть подробнее (минимум 3 символа)."); return
-        kind = flow_now.get("values", {}).get("type", "idea"); username = message.from_user.username or None
+        if len(body) < 3:
+            await message.answer("Напиши, пожалуйста, чуть подробнее (минимум 3 символа).")
+            return
+        kind = flow_now.get("values", {}).get("type", "idea")
+        username = message.from_user.username or None
         try:
             with db() as conn:
-                cur = conn.execute("INSERT INTO bot_feedback(user_id,username,language_code,feedback_type,message) VALUES(?,?,?,?,?)", (uid, username, getattr(message.from_user, "language_code", None), kind, body[:4000])); feedback_id = cur.lastrowid; conn.commit()
+                cur = conn.execute(
+                    "INSERT INTO bot_feedback(user_id,username,language_code,feedback_type,message) VALUES(?,?,?,?,?)",
+                    (uid, username, getattr(message.from_user, "language_code", None), kind, body[:4000])
+                )
+                feedback_id = cur.lastrowid
+                conn.commit()
         except sqlite3.Error:
-            logging.exception("Could not save bot feedback"); await message.answer("Не удалось сохранить отзыв. Попробуй ещё раз позже.", reply_markup=make_keyboard()); USER_FLOWS.pop(uid, None); return
-        USER_FLOWS.pop(uid, None); await message.answer("💙 Спасибо! Отзыв сохранён. Он поможет сделать TrustMap Korea лучше.", reply_markup=make_keyboard())
+            logging.exception("Could not save bot feedback")
+            await message.answer("Не удалось сохранить отзыв. Попробуй ещё раз позже.", reply_markup=make_keyboard())
+            USER_FLOWS.pop(uid, None)
+            return
+        USER_FLOWS.pop(uid, None)
+        await message.answer("💙 Спасибо! Отзыв сохранён. Он поможет сделать TrustMap Korea лучше.", reply_markup=make_keyboard())
         if ADMIN_TELEGRAM_ID:
             try:
-                await message.bot.send_message(int(ADMIN_TELEGRAM_ID), f"💬 НОВЫЙ ОТЗЫВ TRUSTMAP KOREA #{feedback_id}\nТип: {FEEDBACK_LABELS.get(kind,kind)}\nПользователь: @{username or 'без username'} (ID {uid})\nЯзык Telegram: {getattr(message.from_user,'language_code',None) or 'не указан'}\n\n{body[:3000]}\n\nЧитать сохранённые отзывы: /feedbacks")
-            except Exception: logging.exception("Could not notify bot owner about feedback")
+                await message.bot.send_message(
+                    int(ADMIN_TELEGRAM_ID),
+                    f"💬 НОВЫЙ ОТЗЫВ TRUSTMAP KOREA #{feedback_id}\n"
+                    f"Тип: {FEEDBACK_LABELS.get(kind, kind)}\n"
+                    f"Пользователь: @{username or 'без username'} (ID {uid})\n"
+                    f"Язык Telegram: {getattr(message.from_user,'language_code',None) or 'не указан'}\n\n"
+                    f"{body[:3000]}\n\nЧитать сохранённые отзывы: /feedbacks"
+                )
+            except Exception:
+                logging.exception("Could not notify bot owner about feedback")
         return
 
-    # Job button opens a vacancy flow instead of searching employment agencies in Kakao.
-    if text == "💼 Работа":
-        USER_FLOWS[uid] = {"kind": "jobs", "stage": "query", "values": {}}
-        await message.answer("💼 Поиск вакансий по Южной Корее\n\nНапиши, какую работу ищешь и где. Например:\n«Склад в Чхонане, зарплата от 3 млн вон, дневная смена, желательно жильё»\n\nЯ постараюсь найти конкретные объявления и показать зарплату, график, требования, визовые условия, контакты и оригинальные ссылки. Если данных нет в объявлении, отмечу это.")
-        return
+    # Continue custom-value housing stages before interpreting the text as a new query.
+    flow = USER_FLOWS.get(uid)
+    if flow and flow.get("kind") == "housing":
+        stage = flow.get("stage")
+        if stage == "city":
+            city = find_city(text) or text.strip()
+            await begin_housing_city(message, uid, city)
+            return
+        if stage in ("monthly_custom", "deposit_custom", "saleprice"):
+            raw = re.sub(r"[,\s₩원]", "", text.lower())
+            if raw in ("любой бюджет", "любой", "без ограничений", "any", "не важно"):
+                amount = None
+            else:
+                try:
+                    amount = int(raw)
+                    if amount < 0:
+                        raise ValueError
+                except ValueError:
+                    await message.answer("Введи сумму цифрами в вонах, например 5000000, или напиши «любой бюджет».")
+                    return
+            if stage == "monthly_custom":
+                flow["values"]["monthly_max"] = amount
+                flow["stage"] = "deposit"
+                await message.answer("💰 Какой залог 보증금 подходит?", reply_markup=housing_price_keyboard("deposit"))
+                return
+            if stage == "deposit_custom":
+                flow["values"]["deposit_max"] = amount
+                await finish_housing_search(message, uid)
+                return
+            flow["values"]["sale_max"] = amount
+            await finish_housing_search(message, uid)
+            return
 
     flow = USER_FLOWS.get(uid)
     if flow and flow.get("kind") == "jobs" and flow.get("stage") == "query" and text not in [item for row in CATEGORIES for item in row]:
         USER_FLOWS.pop(uid, None)
-        await message.answer("💼 Ищу публичные объявления. Это может занять до минуты…")
+        await message.answer("⏳ Обрабатывается запрос…")
         result = await ask_jobs_ai(text, message.from_user.id)
         await send_long(message, result + job_search_links(text))
-        await message.answer("ℹ️ Вакансии и условия могут измениться. Перед откликом проверь оригинальное объявление и не отправляй деньги за обещание трудоустройства или визы.", reply_markup=make_keyboard())
+        await message.answer(
+            "ℹ️ Вакансии и условия могут измениться. Перед откликом проверь оригинальное объявление "
+            "и не отправляй деньги за обещание трудоустройства или визы.",
+            reply_markup=make_keyboard()
+        )
         return
 
     if text in [item for row in CATEGORIES for item in row]:
         USER_FLOWS.pop(uid, None)
+        if text == "🏠 Недвижимость":
+            USER_FLOWS[uid] = {"kind": "housing", "stage": "type", "values": {}}
+            await message.answer("🏠 Какой тип жилья ищешь?", reply_markup=housing_type_keyboard())
+            return
         category_queries = {
-            "🔎 Поиск мест": None, "🏥 Медицина": "медицинские учреждения", "🍽️ Кафе и рестораны": "кафе или ресторан",
-            "🛍️ Магазины": "магазин", "🚗 Авто и запчасти": "автосервис или автозапчасти", "🚙 Аренда машины": "аренда машины",
-            "🏠 Недвижимость": "агентства недвижимости", "💄 Красота и уход": "салон красоты", "👶 Товары для детей": "детские товары",
-            "🧸 Игрушки": "магазин игрушек", "🐾 Товары для животных": "зоомагазин", "🔧 Бытовые услуги": "бытовые услуги",
-            "🏨 Отели": "отель", "📍 Достопримечательности": "достопримечательности", "💰 Сравнение цен": None,
+            "🔎 Поиск мест": None, "🏥 Медицина": "медицинские учреждения",
+            "🍽️ Кафе и рестораны": "кафе или ресторан", "🛍️ Магазины": "магазин",
+            "🚗 Авто и запчасти": "автосервис или автозапчасти", "🚙 Аренда машины": "аренда машины",
+            "💄 Красота и уход": "салон красоты", "👶 Товары для детей": "детские товары",
+            "🧸 Игрушки": "магазин игрушек", "🐾 Товары для животных": "зоомагазин",
+            "🔧 Бытовые услуги": "бытовые услуги", "🏨 Отели": "отель",
+            "📍 Достопримечательности": "достопримечательности", "💰 Сравнение цен": None,
             "🧖 Бани и сауны": "бани и сауны", "🎮 Компьютерные клубы": "компьютерные клубы",
         }
         preset = category_queries.get(text)
@@ -782,59 +1415,83 @@ async def handle_message(message: Message):
             else:
                 USER_FLOWS[uid] = {"kind": "search", "stage": "city", "values": {"query": preset, "budget": "any"}}
                 await message.answer(f"{text}\n\n📍 Выбери город или поиск по всей Корее:", reply_markup=city_keyboard())
-        else: await message.answer("Напиши, что именно ищем. Например: «недорогие игрушки в Чхонане».")
+        else:
+            await message.answer("Напиши, что именно ищем. Например: «недорогие игрушки в Чхонане».")
         return
 
     flow = USER_FLOWS.get(uid)
-    if flow and flow.get("stage") == "city":
+    if flow and flow.get("kind") == "search" and flow.get("stage") == "city":
         city_ko = find_city(text)
-        if not city_ko and flow.get("allow_custom_city"): city_ko = text.strip()
+        if not city_ko and flow.get("allow_custom_city"):
+            city_ko = text.strip()
         if city_ko:
-            query = flow.get("values", {}).get("query", ""); budget = flow.get("values", {}).get("budget", "any"); USER_FLOWS.pop(uid, None)
-            await start_place_search(message, f"{query} {city_ko}", uid, budget); return
-        if is_place_search(text): USER_FLOWS.pop(uid, None)
-        else:
-            await message.answer("Не распознал город. Выбери его кнопкой, нажми «Другой город» или «Искать по Корее».", reply_markup=city_keyboard()); return
+            query = flow.get("values", {}).get("query", "")
+            budget = flow.get("values", {}).get("budget", "any")
+            USER_FLOWS.pop(uid, None)
+            await start_place_search(message, f"{query} {city_ko}", uid, budget)
+            return
+        if not is_place_search(text):
+            await message.answer("Не распознал город. Выбери его кнопкой, нажми «Другой город» или «Искать по Корее».", reply_markup=city_keyboard())
+            return
 
     if any(x in q for x in ("помнишь", "что я искал раньше", "что я искала раньше", "предыдущий поиск", "мой прошлый поиск")):
         memory = get_search_memory_context(uid)
-        if not memory: await message.answer("🧠 Пока нет сохранённых поисков. Сначала найди место через TrustMap.")
+        if not memory:
+            await message.answer("🧠 Пока нет сохранённых поисков. Сначала найди место через TrustMap.")
         else:
-            await message.answer("🧠 Проверяю сохранённые поиски…"); await send_long(message, await ask_ai(text, message.from_user.id))
+            await message.answer("⏳ Обрабатывается запрос…")
+            await send_long(message, await ask_ai(text, message.from_user.id))
         return
 
     if is_job_query(text):
-        await message.answer("💼 Ищу публичные объявления о работе…")
+        await message.answer("⏳ Обрабатывается запрос…")
         result = await ask_jobs_ai(text, message.from_user.id)
         await send_long(message, result + job_search_links(text))
-        await message.answer("ℹ️ Перед откликом проверь оригинальное объявление. Не плати за обещание гарантированного трудоустройства или визы.", reply_markup=make_keyboard())
+        await message.answer(
+            "ℹ️ Перед откликом проверь оригинальное объявление. Не плати за обещание гарантированного трудоустройства или визы.",
+            reply_markup=make_keyboard()
+        )
         return
 
     if looks_like_ai(text):
-        USER_FLOWS.pop(uid, None); await message.answer("🤖 ИИ ищет информацию и готовит ответ…"); await send_long(message, await ask_ai(text, message.from_user.id)); return
+        USER_FLOWS.pop(uid, None)
+        await message.answer("⏳ Обрабатывается запрос…")
+        await send_long(message, await ask_ai(text, message.from_user.id))
+        return
 
     if is_place_search(text) or any(x in q for x in ("медицинские учреждения", "больница", "аптека", "клиника", "скорая помощь")):
         USER_FLOWS.pop(uid, None)
-        needs_budget = any(x in q for x in ("игруш", "toy", "аренд", "прокат машин", "аренда авто", "аренда машины", "렌터카")); budget = "any"
+        needs_budget = any(x in q for x in ("игруш", "toy", "аренд", "прокат машин", "аренда авто", "аренда машины", "렌터카"))
+        budget = "any"
         if needs_budget and not any(x in q for x in ("дешев", "недорог", "дорог", "премиум", "cheap", "premium")):
             USER_FLOWS[uid] = {"kind": "search", "stage": "budget", "values": {"query": text, "budget": "any"}}
-            await message.answer("💰 Какой ценовой вариант предпочитаешь?", reply_markup=preference_keyboard()); return
-        if any(x in q for x in ("дешев", "недорог", "cheap")): budget = "cheap"
-        elif any(x in q for x in ("дорог", "премиум", "premium", "люкс")): budget = "premium"
-        elif any(x in q for x in ("средний бюджет", "средняя цена")): budget = "mid"
-        await start_place_search(message, text, uid, budget); return
+            await message.answer("💰 Какой ценовой вариант предпочитаешь?", reply_markup=preference_keyboard())
+            return
+        if any(x in q for x in ("дешев", "недорог", "cheap")):
+            budget = "cheap"
+        elif any(x in q for x in ("дорог", "премиум", "premium", "люкс")):
+            budget = "premium"
+        elif any(x in q for x in ("средний бюджет", "средняя цена")):
+            budget = "mid"
+        await start_place_search(message, text, uid, budget)
+        return
 
-    USER_FLOWS.pop(uid, None); await message.answer("🤖 Передаю сообщение ИИ-помощнику…"); await send_long(message, await ask_ai(text, message.from_user.id))
+    USER_FLOWS.pop(uid, None)
+    await message.answer("⏳ Обрабатывается запрос…")
+    await send_long(message, await ask_ai(text, message.from_user.id))
 
 
 async def main():
-    if not TOKEN: raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения.")
-    init_db(); bot = Bot(token=TOKEN)
+    if not TOKEN:
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения.")
+    init_db()
+    bot = Bot(token=TOKEN)
     try:
         await dp.start_polling(bot)
     finally:
         for task in list(SEARCH_TASKS.values()):
-            if not task.done(): task.cancel()
+            if not task.done():
+                task.cancel()
         await bot.session.close()
 
 
