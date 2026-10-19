@@ -33,6 +33,7 @@ MAX_HISTORY_MESSAGES = 12
 # Telegram callback_data is limited to 64 bytes. Place IDs are kept in a short-lived
 # per-user cache; callbacks contain only the cache index.
 PLACE_RESULTS = {}
+JOB_RESULTS = {}
 MAX_PLACE_RESULTS_PER_USER = 30
 
 # Curated photo spots inspired by publicly visible posts from the Instagram accounts
@@ -222,6 +223,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
             language_code TEXT, feedback_type TEXT NOT NULL, message TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_job_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
+            message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit()
 
 
@@ -330,6 +335,71 @@ def preference_keyboard():
         [InlineKeyboardButton(text=t, callback_data=f"budget:{v}") for t, v in options[2:]],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="city:cancel")]
     ])
+
+
+JOB_TYPES = {
+    "official": ("🏢 Официальная работа", "официальная работа, трудоустройство по договору"),
+    "factory": ("🏭 Завод / производство", "работа на заводе или производстве"),
+    "office": ("💻 Офис", "офисная работа"),
+    "cafe": ("☕ Кафе / ресторан", "работа в кафе или ресторане"),
+    "parttime": ("🧾 Арбайт / подработка", "официальная подработка (арбайт)"),
+    "warehouse": ("📦 Склад / упаковка", "работа на складе, упаковка"),
+    "cleaning": ("🧹 Уборка / клининг", "уборка или клининг"),
+    "delivery": ("🚚 Доставка / водитель", "доставка или работа водителем"),
+    "construction": ("🦺 Стройка", "строительные работы"),
+    "care": ("🤝 Уход / помощь", "работа по уходу или помощь"),
+    "other": ("🔎 Другая работа", "другая работа или подработка"),
+}
+JOB_SHIFTS = {
+    "regular": ("📅 Постоянная работа", "постоянная работа"),
+    "day": ("☀️ Только день", "только дневная смена"),
+    "night": ("🌙 Только ночь", "только ночная смена"),
+    "rotating": ("🔁 Сменный график", "сменный график"),
+    "any": ("🕒 Любой график", "любой график"),
+}
+JOB_PAY = {
+    "hourly11": ("От 11 000 ₩/час", "почасовая оплата от 11000 вон"),
+    "hourly12": ("От 12 000 ₩/час", "почасовая оплата от 12000 вон"),
+    "monthly25": ("От 2,5 млн ₩/мес.", "месячная зарплата от 2500000 вон"),
+    "monthly30": ("От 3 млн ₩/мес.", "месячная зарплата от 3000000 вон"),
+    "monthly35": ("От 3,5 млн ₩/мес.", "месячная зарплата от 3500000 вон"),
+    "any": ("💰 Любая зарплата", "зарплата не ограничена"),
+    "custom": ("✍️ Ввести свою сумму", "custom"),
+}
+
+def jobs_type_keyboard():
+    items = list(JOB_TYPES.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        rows.append([InlineKeyboardButton(text=items[j][1][0], callback_data=f"jobs:type:{items[j][0]}")
+                     for j in range(i, min(i + 2, len(items)))])
+    rows += [[InlineKeyboardButton(text="➕ Добавить вакансию", callback_data="jobs:post")],
+             [InlineKeyboardButton(text="❌ Отмена", callback_data="jobs:cancel")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def jobs_shift_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=JOB_SHIFTS[k][0], callback_data=f"jobs:shift:{k}")]
+        for k in ("regular", "day", "night", "rotating", "any")
+    ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="jobs:cancel")]])
+
+def jobs_pay_keyboard():
+    keys = ("hourly11", "hourly12", "monthly25", "monthly30", "monthly35", "any", "custom")
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([InlineKeyboardButton(text=JOB_PAY[k][0], callback_data=f"jobs:pay:{k}") for k in keys[i:i+2]])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="jobs:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def job_results_keyboard(jobs):
+    rows = []
+    for i, job in enumerate(jobs[:8]):
+        title = (job.get("title") or f"Вариант {i+1}").strip()
+        if len(title) > 48:
+            title = title[:45] + "..."
+        rows.append([InlineKeyboardButton(text=f"📄 {i+1}. {title}", callback_data=f"jobresult:{i}")])
+    rows.append([InlineKeyboardButton(text="🔎 Новый поиск", callback_data="jobs:restart")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def housing_type_keyboard():
@@ -729,32 +799,73 @@ async def ask_ai(question, user_id, extra_instructions=""):
 
 async def ask_jobs_ai(query, user_id):
     prompt = (
-        "Найди реальные, актуальные публичные вакансии в Южной Корее по запросу пользователя: " + query + ". "
-        "Используй веб-поиск, если доступен. Ищи Work24, Saramin, JobKorea, Albamon, AlbaCheonguk, EPS "
-        "и открытые страницы работодателей/сообществ. Найди до 5 конкретных объявлений. "
-        "Для каждой вакансии укажи работодателя, должность, город, зарплату, график, требования, визу, жильё, "
-        "контакты, дату публикации и прямую ссылку. Поля без подтверждения отмечай «Не указано в объявлении». "
-        "Не выдумывай телефон, зарплату, визу, жильё, дату или ссылку. Если конкретных объявлений найти не удалось, "
-        "честно скажи об этом. Не утверждай, что проверил весь интернет."
+        "Найди реальные, публично доступные вакансии в Южной Корее по параметрам: " + query + ". "
+        "Используй веб-поиск. Ищи Work24, Saramin, JobKorea, Albamon, AlbaCheonguk, открытые страницы "
+        "работодателей и публичные объявления. Верни до 8 конкретных вакансий. Каждую вакансию начинай "
+        "отдельным блоком с заголовком в формате 'Вакансия 1 — должность / работодатель'. Внутри каждого блока "
+        "отдельными строками укажи: тип работы; работодатель; город и точный адрес, если опубликован; зарплата; "
+        "дневная/ночная/сменная работа; телефон работодателя, только если публично указан; требования; дата объявления; "
+        "прямая ссылка на оригинал. Неизвестные поля помечай 'Не указано в объявлении'. Не выдумывай вакансии, "
+        "адреса, телефоны, зарплаты, даты или ссылки. Если конкретных вакансий нет, скажи это прямо и дай ссылки "
+        "на подходящие поисковые страницы."
     )
     return await ask_ai(prompt, user_id, extra_instructions=(
-        "РЕЖИМ ПОИСКА ВАКАНСИЙ. Приоритет — конкретные объявления с прямыми ссылками и свежими датами. "
-        "Не раскрывай личные данные соискателей; контакты работодателя показывай только если они публично указаны."
+        "РЕЖИМ ПОИСКА ВАКАНСИЙ. Показывай только конкретные вакансии, которые реально видны в доступных "
+        "публичных источниках. Контакты работодателя показывай только если они опубликованы самим работодателем. "
+        "Не обещай полный охват интернета и не раскрывай личные данные соискателей."
     ))
-
 
 def job_search_links(query):
     q = quote_plus(query)
     return (
-        "\n\n🔎 Дополнительные поиски:\n"
-        "• Work24: https://www.work24.go.kr/\n"
-        "• Saramin: https://www.saramin.co.kr/\n"
-        "• JobKorea: https://www.jobkorea.co.kr/\n"
-        "• Albamon: https://www.albamon.com/\n"
-        "• AlbaCheonguk: https://www.alba.co.kr/\n"
-        f"• Naver: https://search.naver.com/search.naver?query={q}%20%EC%B1%84%EC%9A%A9\n"
-        f"• Google: https://www.google.com/search?q={q}+jobs+South+Korea"
+        "\n\n🔎 Дополнительные сайты поиска вакансий:\n"
+        "Work24: https://www.work24.go.kr/\n"
+        "Saramin: https://www.saramin.co.kr/\n"
+        "JobKorea: https://www.jobkorea.co.kr/\n"
+        "Albamon (арбайт): https://www.albamon.com/\n"
+        "AlbaCheonguk (арбайт): https://www.alba.co.kr/\n"
+        f"Naver: https://search.naver.com/search.naver?query={q}%20%EC%B1%84%EC%9A%A9"
     )
+
+def split_job_results(text):
+    matches = list(re.finditer(r"(?im)^\s*(?:вакансия\s*)?\d+[.)—:-]\s*[^\n]+", text))
+    jobs = []
+    if matches:
+        for i, match in enumerate(matches[:8]):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            block = text[match.start():end].strip()
+            first = block.splitlines()[0].strip().lstrip("#*- ")
+            title = re.sub(r"(?i)^вакансия\s*\d*\s*[—:-]?\s*", "", first)
+            jobs.append({"title": title[:80] or f"Вариант {i+1}", "details": block})
+    elif text.strip():
+        jobs.append({"title": "Посмотреть результаты поиска", "details": text.strip()})
+    return jobs[:8]
+
+async def finish_jobs_search(message, uid, city):
+    flow = USER_FLOWS.get(uid)
+    if not flow or flow.get("kind") != "jobs":
+        return
+    values = flow.get("values", {})
+    type_text = JOB_TYPES.get(values.get("job_type", "other"), JOB_TYPES["other"])[1]
+    shift_text = JOB_SHIFTS.get(values.get("shift", "any"), JOB_SHIFTS["any"])[1]
+    pay_text = values.get("pay_text", JOB_PAY["any"][1])
+    city_text = CITY_LABELS.get(city, city) if city != "전국" else "вся Южная Корея"
+    query = (f"{type_text}; график: {shift_text}; желаемая зарплата: {pay_text}; город: {city_text}. "
+             "Ищи объявления, соответствующие параметрам, и не выдумывай данные.")
+    USER_FLOWS.pop(uid, None)
+    await message.answer("🔎 Ищу вакансии по выбранным параметрам…")
+    result = await ask_jobs_ai(query, message.from_user.id)
+    jobs = split_job_results(result)
+    JOB_RESULTS[uid] = jobs
+    if not jobs:
+        await send_long(message, result + job_search_links(query))
+        return
+    await message.answer(
+        f"💼 Результаты поиска\n📍 {city_text}\nНайдено вариантов: {len(jobs)}. Нажми на вариант, чтобы открыть подробности.\n"
+        "Адрес и телефон будут указаны только если они есть в исходном объявлении.",
+        reply_markup=job_results_keyboard(jobs), disable_web_page_preview=True
+    )
+    await send_long(message, job_search_links(query))
 
 
 async def send_long(message, text):
@@ -892,6 +1003,78 @@ def feedback_kind_keyboard():
         [InlineKeyboardButton(text="🐞 Ошибка в боте", callback_data="feedback:bug")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="feedback:cancel")]
     ])
+
+
+@dp.callback_query(F.data.startswith("jobs:"))
+async def jobs_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    choice = parts[2] if len(parts) > 2 else ""
+    if action == "cancel":
+        USER_FLOWS.pop(uid, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Поиск отменён")
+        return
+    if action == "restart":
+        USER_FLOWS[uid] = {"kind": "jobs", "stage": "type", "values": {}}
+        await callback.message.answer("💼 Какую работу ищем?", reply_markup=jobs_type_keyboard())
+        await callback.answer()
+        return
+    if action == "post":
+        USER_FLOWS[uid] = {"kind": "jobs_submit", "stage": "message", "values": {}}
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            "➕ Отправь одним сообщением текст вакансии: должность, город, адрес, зарплата, график и публичный контакт работодателя. "
+            "Не публикуй чужие личные данные. Объявление сохранится на проверку перед публикацией."
+        )
+        await callback.answer()
+        return
+    flow = USER_FLOWS.get(uid)
+    if not flow or flow.get("kind") != "jobs":
+        await callback.answer("Этот выбор уже не активен. Нажми «Работа» заново.", show_alert=True)
+        return
+    if action == "type" and choice in JOB_TYPES:
+        flow["values"]["job_type"] = choice
+        flow["stage"] = "shift"
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("🕒 Какой график тебе подходит?", reply_markup=jobs_shift_keyboard())
+        await callback.answer()
+        return
+    if action == "shift" and choice in JOB_SHIFTS:
+        flow["values"]["shift"] = choice
+        flow["stage"] = "pay"
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("💰 Какая зарплата тебя устроит?", reply_markup=jobs_pay_keyboard())
+        await callback.answer()
+        return
+    if action == "pay" and choice in JOB_PAY:
+        if choice == "custom":
+            flow["stage"] = "pay_custom"
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("✍️ Напиши желаемую зарплату (например, 13 000 вон/час или от 3 000 000 вон в месяц).")
+            await callback.answer()
+            return
+        flow["values"]["pay_text"] = JOB_PAY[choice][1]
+        flow["stage"] = "city"
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("📍 В каком городе искать вакансии?", reply_markup=city_keyboard())
+        await callback.answer()
+        return
+    await callback.answer("Неизвестный выбор. Начни поиск заново.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("jobresult:"))
+async def job_result_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    try:
+        index = int((callback.data or "").split(":", 1)[1])
+        job = JOB_RESULTS.get(uid, [])[index]
+    except (ValueError, IndexError):
+        await callback.answer("Результаты устарели. Запусти новый поиск.", show_alert=True)
+        return
+    await callback.message.answer("💼 " + job["title"] + "\n\n" + job["details"], disable_web_page_preview=True)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("photo:"))
@@ -1091,6 +1274,9 @@ async def city_callback(callback: CallbackQuery):
         if flow.get("kind") == "housing":
             await begin_housing_city(callback.message, user_id, "전국")
             return
+        if flow.get("kind") == "jobs":
+            await finish_jobs_search(callback.message, user_id, "전국")
+            return
         query = flow.get("values", {}).get("query", "")
         budget = flow.get("values", {}).get("budget", "any")
         USER_FLOWS.pop(user_id, None)
@@ -1107,6 +1293,11 @@ async def city_callback(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer(f"Город: {CITY_LABELS.get(city_ko, city_ko)}")
         await begin_housing_city(callback.message, user_id, city_ko)
+        return
+    if flow.get("kind") == "jobs":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer(f"Город: {CITY_LABELS.get(city_ko, city_ko)}")
+        await finish_jobs_search(callback.message, user_id, city_ko)
         return
     query = flow.get("values", {}).get("query", "")
     budget = flow.get("values", {}).get("budget", "any")
@@ -1247,18 +1438,12 @@ async def search_housing_sources(message, query, user_id, values):
         await message.answer(error)
         return
     agencies = [p for p in (found or []) if "부동산" in (p.get("category_name", "") + p.get("place_name", ""))]
-    if not agencies:
-        await message.answer(
-            "ℹ️ Kakao не вернул агентства недвижимости по этому запросу. Это не подтверждает отсутствие жилья. "
-            "Попробуй изменить город или параметры."
-        )
-    else:
+    if agencies:
         PLACE_RESULTS[str(user_id)] = {}
         await message.answer(
             "🏢 Агентства недвижимости из Kakao. Нажми на название, чтобы открыть контакты:",
             reply_markup=place_list_keyboard(user_id, agencies)
         )
-    await message.answer("ℹ️ Цены и наличие нужно подтвердить у владельца или агентства.", reply_markup=make_keyboard())
 
 
 @dp.callback_query(F.data.startswith("monthlyprice:"))
@@ -1384,6 +1569,7 @@ async def handle_message(message: Message):
         CONVERSATION_HISTORY.pop(uid, None)
         USER_FLOWS.pop(uid, None)
         PLACE_RESULTS.pop(uid, None)
+        JOB_RESULTS.pop(uid, None)
         deleted, failed = await clear_chat(message.bot, message.chat.id)
         extra = f"\nTelegram не разрешил удалить {failed} сообщений." if failed else ""
         await message.answer(
@@ -1442,8 +1628,53 @@ async def handle_message(message: Message):
                 logging.exception("Could not notify bot owner about feedback")
         return
 
-    # Continue custom-value housing stages before interpreting the text as a new query.
+    # Accept user-submitted job ads for moderation before publication.
     flow = USER_FLOWS.get(uid)
+    if flow and flow.get("kind") == "jobs_submit" and flow.get("stage") == "message":
+        if len(text) < 15:
+            await message.answer("Добавь чуть больше информации о вакансии (минимум 15 символов).")
+            return
+        username = message.from_user.username or None
+        try:
+            with db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO user_job_posts(user_id,username,message) VALUES(?,?,?)",
+                    (uid, username, text[:5000])
+                )
+                post_id = cur.lastrowid
+                conn.commit()
+            USER_FLOWS.pop(uid, None)
+            await message.answer("✅ Вакансия отправлена на проверку. После проверки её можно будет добавить в общий список.", reply_markup=make_keyboard())
+            if ADMIN_TELEGRAM_ID:
+                try:
+                    await message.bot.send_message(
+                        int(ADMIN_TELEGRAM_ID),
+                        f"➕ ВАКАНСИЯ НА ПРОВЕРКУ #{post_id}\nОт: @{username or 'без username'} (ID {uid})\n\n{text[:3500]}"
+                    )
+                except Exception:
+                    logging.exception("Could not notify admin about user job post")
+        except sqlite3.Error:
+            logging.exception("Could not save user job post")
+            USER_FLOWS.pop(uid, None)
+            await message.answer("Не удалось сохранить вакансию. Попробуй позже.", reply_markup=make_keyboard())
+        return
+
+    # Continue custom salary and city stages before interpreting the text as a new query.
+    flow = USER_FLOWS.get(uid)
+    if flow and flow.get("kind") == "jobs" and flow.get("stage") == "pay_custom":
+        flow["values"]["pay_text"] = text[:120]
+        flow["stage"] = "city"
+        await message.answer("📍 В каком городе искать вакансии?", reply_markup=city_keyboard())
+        return
+    if flow and flow.get("kind") == "jobs" and flow.get("stage") == "city":
+        city = find_city(text)
+        if not city and flow.get("allow_custom_city"):
+            city = text.strip()
+        if not city:
+            await message.answer("Не распознал город. Выбери город кнопкой или нажми «Другой город».", reply_markup=city_keyboard())
+            return
+        await finish_jobs_search(message, uid, city)
+        return
     if flow and flow.get("kind") == "housing":
         stage = flow.get("stage")
         if stage == "city":
@@ -1475,19 +1706,6 @@ async def handle_message(message: Message):
             await finish_housing_search(message, uid)
             return
 
-    flow = USER_FLOWS.get(uid)
-    if flow and flow.get("kind") == "jobs" and flow.get("stage") == "query" and text not in [item for row in CATEGORIES for item in row]:
-        USER_FLOWS.pop(uid, None)
-        await message.answer("⏳ Обрабатывается запрос…")
-        result = await ask_jobs_ai(text, message.from_user.id)
-        await send_long(message, result + job_search_links(text))
-        await message.answer(
-            "ℹ️ Вакансии и условия могут измениться. Перед откликом проверь оригинальное объявление "
-            "и не отправляй деньги за обещание трудоустройства или визы.",
-            reply_markup=make_keyboard()
-        )
-        return
-
     if text in [item for row in CATEGORIES for item in row]:
         USER_FLOWS.pop(uid, None)
         if text == "📸 Места для фото":
@@ -1496,6 +1714,10 @@ async def handle_message(message: Message):
         if text == "🏠 Недвижимость":
             USER_FLOWS[uid] = {"kind": "housing", "stage": "type", "values": {}}
             await message.answer("🏠 Какой тип жилья ищешь?", reply_markup=housing_type_keyboard())
+            return
+        if text == "💼 Работа":
+            USER_FLOWS[uid] = {"kind": "jobs", "stage": "type", "values": {}}
+            await message.answer("💼 Какую работу ищем?", reply_markup=jobs_type_keyboard())
             return
         category_queries = {
             "🔎 Поиск мест": None, "🏥 Медицина": "медицинские учреждения",
