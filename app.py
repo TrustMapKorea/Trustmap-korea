@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import sqlite3
+import hashlib
 from contextlib import closing
 from difflib import SequenceMatcher
 from urllib.parse import quote_plus
@@ -20,10 +21,17 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 KAKAO_KEY = os.getenv("KAKAO_REST_API_KEY")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+NAVER_API_BASE = "https://naverapihub.apigw.ntruss.com"
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "trustmap.db")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
+try:
+    COMMUNITY_MAX_BROADCAST = max(1, int(os.getenv("COMMUNITY_MAX_BROADCAST", "500")))
+except ValueError:
+    COMMUNITY_MAX_BROADCAST = 500
 
 dp = Dispatcher()
 CONVERSATION_HISTORY = {}
@@ -214,6 +222,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, place_id TEXT NOT NULL, place_name TEXT NOT NULL,
             user_id TEXT NOT NULL, dimension TEXT NOT NULL, score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 5),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(place_id,user_id,dimension))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS place_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, place_id TEXT NOT NULL, place_name TEXT NOT NULL,
+            user_id TEXT NOT NULL, username TEXT, comment TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS search_memory (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, query TEXT NOT NULL,
             korean_query TEXT NOT NULL, results_json TEXT NOT NULL DEFAULT '[]',
@@ -233,6 +245,25 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
             message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS community_members (
+            user_id TEXT PRIMARY KEY, username TEXT, active INTEGER NOT NULL DEFAULT 1,
+            blocked INTEGER NOT NULL DEFAULT 0, joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS community_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
+            message_text TEXT NOT NULL DEFAULT '', media_type TEXT, source_message_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'published',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS community_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL, reporter_id TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'Жалоба пользователя',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(post_id, reporter_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS community_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL,
+            recipient_id TEXT NOT NULL, delivered_message_id INTEGER NOT NULL,
+            UNIQUE(post_id, recipient_id, delivered_message_id))""")
         conn.commit()
 
 
@@ -470,7 +501,7 @@ def get_search_memory_context(user_id, limit=8):
         return ""
     lines = ["СОХРАНЁННЫЕ ПОИСКИ ПОЛЬЗОВАТЕЛЯ:"]
     for query, ko, raw, created in reversed(rows):
-        lines.append(f"- {created}: запрос «{query}»; поиск Kakao: {ko}")
+        lines.append(f"- {created}: запрос «{query}»; поиск Kakao + NAVER: {ko}")
         try:
             places = json.loads(raw or "[]")
         except (ValueError, TypeError):
@@ -589,6 +620,217 @@ async def search_kakao(query):
         return None, "Не удалось связаться с Kakao. Попробуй позже."
 
 
+
+def naver_headers():
+    return {
+        "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+        "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
+    }
+
+
+async def search_naver(endpoint, query, display=5, sort=None):
+    """Call NAVER API HUB Search API. Missing credentials disable Naver gracefully."""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return None, "NAVER API HUB не настроен: проверь NAVER_CLIENT_ID и NAVER_CLIENT_SECRET в Render."
+    params = {"query": str(query)[:200], "display": display, "format": "json"}
+    if sort:
+        params["sort"] = sort
+    url = f"{NAVER_API_BASE}/search/v1/{endpoint}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18)) as session:
+            async with session.get(url, headers=naver_headers(), params=params) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:250]
+                    logging.warning("NAVER %s HTTP %s: %s", endpoint, resp.status, body)
+                    if resp.status in (401, 403):
+                        return None, "NAVER API HUB не принял ключи или доступ к этому API не включён."
+                    return None, f"NAVER API HUB вернул HTTP {resp.status} для {endpoint}."
+                return await resp.json(content_type=None), None
+    except asyncio.TimeoutError:
+        return None, "NAVER API HUB не ответил вовремя."
+    except (aiohttp.ClientError, ValueError):
+        logging.exception("NAVER API request failed: %s", endpoint)
+        return None, "Не удалось связаться с NAVER API HUB."
+
+
+def _clean_naver_html(value):
+    return re.sub(r"<[^>]+>", "", str(value or "")).replace("&amp;", "&").replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+
+
+async def search_naver_local(query):
+    data, error = await search_naver("local", query, display=5, sort="comment")
+    if error or not data:
+        return [], error
+    places = []
+    for item in data.get("items", []):
+        name = _clean_naver_html(item.get("title")) or "Название не указано"
+        road = (item.get("roadAddress") or "").strip()
+        address = (item.get("address") or "").strip()
+        stable = hashlib.sha1(normalize(name + road + address).encode("utf-8")).hexdigest()[:16]
+        places.append({
+            "id": "naver-" + (stable or str(len(places) + 1)),
+            "place_name": name,
+            "category_name": _clean_naver_html(item.get("category")),
+            "category_group_name": "",
+            "road_address_name": road,
+            "address_name": address,
+            "phone": "",
+            "place_url": item.get("link") or "",
+            "naver_url": item.get("link") or "",
+            "source": "NAVER",
+            "description": _clean_naver_html(item.get("description")),
+            "mapx": item.get("mapx", ""),
+            "mapy": item.get("mapy", ""),
+        })
+    return places, None
+
+
+async def search_naver_images(query, display=5):
+    data, error = await search_naver("image", query, display=display, sort="sim")
+    if error or not data:
+        return []
+    results = []
+    for item in data.get("items", []):
+        image_url = item.get("link") or item.get("thumbnail")
+        if not image_url or not str(image_url).startswith("https://"):
+            continue
+        results.append({
+            "title": _clean_naver_html(item.get("title")),
+            "image_url": image_url,
+            "thumbnail": item.get("thumbnail") or image_url,
+            "source_url": item.get("link") or "",
+        })
+    return results
+
+
+
+async def search_naver_blog(query, display=5):
+    data, error = await search_naver("blog", query, display=display, sort="date")
+    if error or not data:
+        return []
+    return data.get("items", [])
+
+
+async def send_naver_job_sources(message, query):
+    """Supplement job search with NAVER blog posts; clearly label them as unverified leads."""
+    items = await search_naver_blog(query, display=5)
+    if not items:
+        return
+    parts = ["\n\n🧭 Дополнительные публикации NAVER (это не подтверждённые вакансии):"]
+    for idx, item in enumerate(items[:3], 1):
+        title = _clean_naver_html(item.get("title")) or "Заголовок не указан"
+        desc = _clean_naver_html(item.get("description")) or "Описание не указано"
+        link = item.get("link") or ""
+        date = item.get("postdate") or "Дата не указана"
+        parts.append(f"{idx}. {title}\n{desc}\n🕒 {date}\n🔗 {link}")
+    await send_long(message, "\n\n".join(parts))
+
+async def search_naver_news(query, display=5):
+    data, error = await search_naver("news", query, display=display, sort="date")
+    if error or not data:
+        return []
+    return data.get("items", [])
+
+
+def _place_identity(place):
+    name = normalize(place.get("place_name", ""))
+    address = normalize(place.get("road_address_name") or place.get("address_name") or "")
+    return re.sub(r"\W+", "", name), re.sub(r"\W+", "", address)
+
+
+async def search_places_combined(query):
+    """Search Kakao and NAVER Local; merge likely duplicates without inventing fields."""
+    kakao_places, kakao_error = await search_kakao(query)
+    naver_places, naver_error = await search_naver_local(query)
+    if kakao_places is None:
+        kakao_places = []
+    merged = []
+    index_by_name = {}
+    for place in list(kakao_places[:15]) + list(naver_places) + list(kakao_places[15:]):
+        name_key, address_key = _place_identity(place)
+        if not name_key:
+            continue
+        matched_index = None
+        if name_key in index_by_name:
+            candidate = index_by_name[name_key]
+            existing_name, existing_address = _place_identity(merged[candidate])
+            if existing_name == name_key and (not address_key or not existing_address or existing_address == address_key):
+                matched_index = candidate
+        if matched_index is None:
+            for idx, existing in enumerate(merged):
+                existing_name, existing_address = _place_identity(existing)
+                if existing_name == name_key and (not address_key or not existing_address or existing_address == address_key):
+                    matched_index = idx
+                    break
+        if matched_index is not None:
+            existing = merged[matched_index]
+            for field in ("road_address_name", "address_name", "phone", "place_url", "naver_url", "category_name", "description", "mapx", "mapy"):
+                if not existing.get(field) and place.get(field):
+                    existing[field] = place[field]
+            sources = set(existing.get("sources", []))
+            sources.add(place.get("source", "Kakao"))
+            existing["sources"] = sorted(sources)
+            if place.get("source") == "NAVER" and place.get("naver_url"):
+                existing["naver_url"] = place["naver_url"]
+        else:
+            copied = dict(place)
+            copied["sources"] = [place.get("source", "Kakao")]
+            index_by_name[name_key] = len(merged)
+            merged.append(copied)
+    if not merged and (kakao_error or naver_error):
+        errors = [err for err in (kakao_error, naver_error) if err]
+        return [], "\n".join(errors)
+    return merged[:MAX_PLACE_RESULTS_PER_USER], None
+
+
+
+def image_looks_relevant(place_name, image_title):
+    """Reject obviously unrelated NAVER image results instead of presenting them as the venue photo."""
+    title = re.sub(r"\W+", "", normalize(image_title))
+    if not title:
+        return False
+    name = str(place_name or "")
+    variants = [re.sub(r"\W+", "", normalize(part)) for part in re.split(r"[·|｜/,()\[\]]+", name)]
+    variants = [v for v in variants if len(v) >= 3]
+    if any(variant in title or title in variant for variant in variants):
+        return True
+    normalized_name = re.sub(r"\W+", "", normalize(name))
+    return bool(normalized_name and SequenceMatcher(None, normalized_name, title).ratio() >= 0.58)
+
+async def send_place_previews(message, user_id, places):
+    """Show NAVER image-search previews for the first few places."""
+    candidates = list(enumerate(places[:5]))
+    async def lookup(candidate):
+        index, place = candidate
+        name = (place.get("place_name") or "Название не указано").strip()
+        address = place.get("road_address_name") or place.get("address_name") or ""
+        images = await search_naver_images(f"{name} {address}".strip(), display=5)
+        relevant = next((image for image in images if image_looks_relevant(name, image.get("title", ""))), None)
+        return index, place, relevant
+    previews = await asyncio.gather(*(lookup(item) for item in candidates), return_exceptions=True)
+    for result in previews:
+        if isinstance(result, Exception):
+            logging.info("NAVER image lookup failed: %s", result)
+            continue
+        index, place, image = result
+        if not image:
+            continue
+        name = (place.get("place_name") or "Название не указано").strip()
+        caption = f"📸 {name}\n🏷️ {describe_category(place)}\n\nФото найдено через NAVER Search. Сверь название и адрес перед поездкой."
+        if len(caption) > 950:
+            caption = caption[:947] + "..."
+        try:
+            await message.answer_photo(
+                photo=image["image_url"],
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="📍 Подробнее о месте", callback_data=f"place:{index}")
+                ]]),
+            )
+        except Exception:
+            logging.info("Could not send NAVER image preview for %s", name)
+        await asyncio.sleep(0.08)
+
 def get_review_summary(place_id):
     try:
         with db() as conn:
@@ -600,6 +842,19 @@ def get_review_summary(place_id):
     except sqlite3.Error:
         logging.exception("Could not read reviews")
         return {}
+
+def get_place_comments(place_id, limit=3):
+    try:
+        with db() as conn:
+            return conn.execute(
+                "SELECT username,comment,created_at FROM place_comments "
+                "WHERE place_id=? ORDER BY id DESC LIMIT ?",
+                (str(place_id), int(limit))
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not read place comments")
+        return []
+
 
 
 def rating_dimensions_for_place(place):
@@ -617,6 +872,7 @@ def review_keyboard(place_id, place):
     dims = rating_dimensions_for_place(place)
     rows = [[InlineKeyboardButton(text=f"⭐ {label}", callback_data=f"rate:{place_id}:{key}")
              for key, label in dims[i:i+2]] for i in range(0, len(dims), 2)]
+    rows.append([InlineKeyboardButton(text="💬 Написать отзыв о месте", callback_data=f"comment:{place_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -872,6 +1128,8 @@ async def finish_jobs_search(message, uid, city):
         reply_markup=job_results_keyboard(jobs), disable_web_page_preview=True
     )
     await send_long(message, job_search_links(query))
+    naver_city = city if city != "전국" else "대한민국"
+    await send_naver_job_sources(message, f"{naver_city} 채용 구인")
 
 
 async def send_long(message, text):
@@ -911,7 +1169,14 @@ def place_detail_text(place):
         f"☎️ Телефон: {phone}",
     ]
     if place.get("place_url"):
-        lines.append(f"🗺️ Карта: {place['place_url']}")
+        lines.append(f"🗺️ Kakao / страница места: {place['place_url']}")
+    if place.get("naver_url"):
+        lines.append(f"🧭 NAVER: {place['naver_url']}")
+    map_query = quote_plus(f"{place.get('place_name', '')} {address}")
+    lines.append(f"🗺️ Найти на Kakao Map: https://map.kakao.com/link/search/{map_query}")
+    lines.append(f"🧭 Найти на NAVER Map: https://map.naver.com/p/search/{map_query}")
+    if place.get("mapx") and place.get("mapy"):
+        lines.append(f"📍 Координаты NAVER: {place['mapx']}, {place['mapy']}")
     if overall:
         lines.append(f"💙 Оценка TrustMap: {overall[0]:.1f}/5 на основе {overall[1]} оценок")
     else:
@@ -919,10 +1184,19 @@ def place_detail_text(place):
     for dim, (avg, count) in summary.items():
         if dim != "overall":
             lines.append(f"  • {RATING_DIMENSIONS.get(dim, dim)}: {avg:.1f}/5 ({count})")
+    comments = get_place_comments(pid, 3) if pid else []
+    lines.append("")
+    lines.append("💬 Последние отзывы пользователей:")
+    if comments:
+        for username, comment, created in comments:
+            author = "@" + username if username else "Пользователь"
+            lines.append(f"• {author} · {created}: {comment[:400]}")
+    else:
+        lines.append("Пока нет письменных отзывов.")
     lines += [
         "",
-        "ℹ️ Данные о месте получены из Kakao. Цены и часы работы могут отсутствовать или меняться.",
-        "Выбери показатель ниже, чтобы оставить оценку."
+        "ℹ️ Источники: " + ", ".join(place.get("sources", [place.get("source", "Kakao")])) + ". Цены и часы работы могут отсутствовать или меняться.",
+        "Выбери показатель ниже или напиши отзыв о месте."
     ]
     return "\n".join(lines)
 
@@ -960,7 +1234,7 @@ async def run_place_search(message, query, user_id, budget="any"):
     for search_query in search_queries:
         if current_task and current_task.cancelling():
             raise asyncio.CancelledError
-        found, error = await search_kakao(search_query)
+        found, error = await search_places_combined(search_query)
         if current_task and current_task.cancelling():
             raise asyncio.CancelledError
         if error:
@@ -978,22 +1252,349 @@ async def run_place_search(message, query, user_id, budget="any"):
     if not places:
         location = CITY_LABELS.get(city_ko, city_ko) if city_ko else "Южной Корее"
         await message.answer(
-            f"😔 По запросу «{query}» в {location} Kakao не вернул результатов.\n"
+            f"😔 По запросу «{query}» в {location} Kakao и NAVER не вернули подходящих результатов.\n"
             "Это не означает, что таких мест нет: попробуй более короткий запрос или другой город.",
             reply_markup=make_keyboard()
         )
         return
     PLACE_RESULTS[str(user_id)] = {}
     keyboard = place_list_keyboard(user_id, places)
+    await send_place_previews(message, user_id, places)
     await message.answer(
         f"🇰🇷 TRUSTMAP KOREA\n\n"
         f"🔎 Найдено мест: {min(len(places), MAX_PLACE_RESULTS_PER_USER)}\n"
         f"Запрос: {query}\n\n"
-        "Выбери место из списка, чтобы открыть адрес, телефон и оценки:",
+        "Выше показаны доступные фото из NAVER Search. Они могут относиться к похожему результату — сверяй название и адрес. "
+        "Выбери место ниже, чтобы открыть подробности:",
         reply_markup=keyboard,
         disable_web_page_preview=True
     )
 
+
+
+def community_menu_keyboard(active=False):
+    rows = []
+    if active:
+        rows.append([InlineKeyboardButton(text="💬 Продолжить чат", callback_data="community:chat")])
+        rows.append([InlineKeyboardButton(text="🚪 Покинуть чат", callback_data="community:leave")])
+    else:
+        rows.append([InlineKeyboardButton(text="💬 Войти в чат", callback_data="community:join")])
+    rows += [
+        [InlineKeyboardButton(text="🔎 Найти новости в NAVER", callback_data="community:news")],
+        [InlineKeyboardButton(text="📰 Предложить новость на проверку", callback_data="community:post")],
+        [InlineKeyboardButton(text="📌 Правила", callback_data="community:rules")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def publish_community_message(message: Message, uid: str):
+    """Relay opted-in users' text/photos/videos to the opted-in community in real time."""
+    try:
+        with db() as conn:
+            member = conn.execute(
+                "SELECT active,blocked FROM community_members WHERE user_id=?", (uid,)
+            ).fetchone()
+            if not member or not member[0] or member[1]:
+                USER_FLOWS.pop(uid, None)
+                await message.answer("Сначала вступи в сообщество через меню «💬 Сообщество».", reply_markup=make_keyboard())
+                return
+            username = message.from_user.username or None
+            conn.execute(
+                "UPDATE community_members SET username=?,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?",
+                (username, uid)
+            )
+            media_type = None
+            if message.photo:
+                media_type = "photo"
+            elif message.video:
+                media_type = "video"
+            elif message.animation:
+                media_type = "animation"
+            elif message.document:
+                media_type = "document"
+            elif message.voice:
+                media_type = "voice"
+            body = (message.text or message.caption or "").strip()
+            cur = conn.execute(
+                "INSERT INTO community_messages(user_id,username,message_text,media_type,source_message_id) VALUES(?,?,?,?,?)",
+                (uid, username, body[:4000], media_type, message.message_id)
+            )
+            post_id = int(cur.lastrowid)
+            conn.commit()
+            members = conn.execute(
+                "SELECT user_id FROM community_members WHERE active=1 AND blocked=0 AND user_id<>? LIMIT ?",
+                (uid, COMMUNITY_MAX_BROADCAST)
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not save community message")
+        await message.answer("Не удалось опубликовать сообщение. Попробуй позже.")
+        return
+
+    report_markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"community:report:{post_id}")
+    ]])
+    sender_label = "@" + username if username else "участник сообщества"
+    reply_context = ""
+    if message.reply_to_message:
+        try:
+            with db() as conn:
+                parent = conn.execute(
+                    "SELECT post_id FROM community_deliveries WHERE recipient_id=? AND delivered_message_id=?",
+                    (uid, int(message.reply_to_message.message_id))
+                ).fetchone()
+                if parent:
+                    original = conn.execute(
+                        "SELECT username,message_text,media_type FROM community_messages WHERE id=?",
+                        (int(parent[0]),)
+                    ).fetchone()
+                else:
+                    original = None
+            if original:
+                parent_author = "@" + original[0] if original[0] else "участника"
+                parent_text = (original[1] or f"[{original[2] or 'медиа'}]").strip()[:180]
+                reply_context = f"↪️ Ответ на {parent_author}: {parent_text}\\n\\n"
+        except sqlite3.Error:
+            logging.exception("Could not resolve community reply")
+    if reply_context:
+        body = reply_context + body
+    delivered = 0
+    for (recipient_id,) in members:
+        try:
+            if media_type:
+                header = await message.bot.send_message(
+                    chat_id=int(recipient_id),
+                    text=f"💬 Сообщество TrustMap Korea · {sender_label}\\n\\n{reply_context.strip()}" if reply_context else f"💬 Сообщество TrustMap Korea · {sender_label}",
+                )
+                with db() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO community_deliveries(post_id,recipient_id,delivered_message_id) VALUES(?,?,?)",
+                        (post_id, str(recipient_id), int(header.message_id))
+                    )
+                    conn.commit()
+                copied = await message.bot.copy_message(
+                    chat_id=int(recipient_id),
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    reply_markup=report_markup,
+                )
+                copied_id = getattr(copied, "message_id", None)
+            else:
+                text_body = body or "(сообщение без текста)"
+                sent = await message.bot.send_message(
+                    chat_id=int(recipient_id),
+                    text=f"💬 Сообщество TrustMap Korea · {sender_label}\n\n{text_body}",
+                    reply_markup=report_markup,
+                    disable_web_page_preview=True,
+                )
+                copied_id = sent.message_id
+            if copied_id:
+                with db() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO community_deliveries(post_id,recipient_id,delivered_message_id) VALUES(?,?,?)",
+                        (post_id, str(recipient_id), int(copied_id))
+                    )
+                    conn.commit()
+            delivered += 1
+            await asyncio.sleep(0.04)
+        except Exception as exc:
+            logging.info("Community delivery failed for recipient %s: %s", recipient_id, exc)
+    await message.answer(
+        f"✅ Сообщение сообщества опубликовано. Получателей: {delivered}. "
+        "Пожаловаться на чужое сообщение можно кнопкой под ним.",
+        reply_markup=make_keyboard()
+    )
+
+
+@dp.message(Command("communityreports"))
+async def community_reports_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT r.id,r.post_id,r.reporter_id,r.created_at,m.user_id,m.username,m.message_text,m.media_type "
+                "FROM community_reports r JOIN community_messages m ON m.id=r.post_id "
+                "WHERE r.status='open' ORDER BY r.id DESC LIMIT 20"
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not read community reports")
+        await message.answer("Не удалось прочитать жалобы.")
+        return
+    if not rows:
+        await message.answer("Открытых жалоб нет.")
+        return
+    for rid, post_id, reporter_id, created, author_id, username, body, media_type in rows:
+        excerpt = (body or f"[{media_type or 'медиа без текста'}]")[:700]
+        await message.answer(
+            f"🚩 Жалоба #{rid} · публикация #{post_id}\nДата: {created}\n"
+            f"Автор: @{username or 'без username'} (ID {author_id})\n"
+            f"Жалоба от ID {reporter_id}\n\n{excerpt}\n\n"
+            f"Скрыть публикацию: /communityhide {post_id}\n"
+            f"Ограничить автора: /communityblock {author_id}"
+        )
+
+
+@dp.message(Command("communityhide"))
+async def community_hide_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        post_id = int((message.text or "").split(maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await message.answer("Использование: /communityhide ID_ПУБЛИКАЦИИ")
+        return
+    try:
+        with db() as conn:
+            deliveries = conn.execute(
+                "SELECT recipient_id,delivered_message_id FROM community_deliveries WHERE post_id=?", (post_id,)
+            ).fetchall()
+            conn.execute("UPDATE community_messages SET status='hidden' WHERE id=?", (post_id,))
+            conn.execute("UPDATE community_reports SET status='reviewed' WHERE post_id=?", (post_id,))
+            conn.commit()
+        deleted = 0
+        for recipient_id, message_id in deliveries:
+            try:
+                await message.bot.delete_message(chat_id=int(recipient_id), message_id=int(message_id))
+                deleted += 1
+            except Exception:
+                pass
+        await message.answer(f"Публикация #{post_id} скрыта. Удалено копий: {deleted}.")
+    except sqlite3.Error:
+        logging.exception("Could not hide community post")
+        await message.answer("Не удалось скрыть публикацию.")
+
+
+@dp.message(Command("communityblock"))
+async def community_block_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        target = (message.text or "").split(maxsplit=1)[1].strip()
+    except IndexError:
+        await message.answer("Использование: /communityblock TELEGRAM_ID")
+        return
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO community_members(user_id,active,blocked) VALUES(?,0,1) "
+                "ON CONFLICT(user_id) DO UPDATE SET active=0,blocked=1",
+                (target,)
+            )
+            conn.commit()
+        USER_FLOWS.pop(target, None)
+        await message.answer(f"Пользователь {target} больше не сможет публиковать сообщения в сообществе.")
+    except sqlite3.Error:
+        logging.exception("Could not block community member")
+        await message.answer("Не удалось ограничить пользователя.")
+
+
+@dp.message(Command("communitypending"))
+async def community_pending_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT id,user_id,username,message,created_at FROM community_posts "
+                "WHERE status='pending' ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+    except sqlite3.Error:
+        logging.exception("Could not read pending community posts")
+        await message.answer("Не удалось прочитать очередь публикаций.")
+        return
+    if not rows:
+        await message.answer("Нет новостей или объявлений, ожидающих проверки.")
+        return
+    for post_id, user_id, username, body, created in rows:
+        await message.answer(
+            f"📰 Публикация на проверку #{post_id} · {created}\n"
+            f"Автор: @{username or 'без username'} (ID {user_id})\n\n{body[:2500]}\n\n"
+            f"Опубликовать: /communityapprove {post_id}\nОтклонить: /communityreject {post_id}"
+        )
+
+
+@dp.message(Command("communityapprove"))
+async def community_approve_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        post_id = int((message.text or "").split(maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await message.answer("Использование: /communityapprove ID_ПУБЛИКАЦИИ")
+        return
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT user_id,username,message,status FROM community_posts WHERE id=?", (post_id,)
+            ).fetchone()
+            if not row or row[3] != "pending":
+                await message.answer("Публикация не найдена или уже обработана.")
+                return
+            conn.execute("UPDATE community_posts SET status='approved' WHERE id=?", (post_id,))
+            cur = conn.execute(
+                "INSERT INTO community_messages(user_id,username,message_text,media_type,status) "
+                "VALUES(?,?,?,?, 'published')",
+                (row[0], row[1], row[2], "news")
+            )
+            live_post_id = int(cur.lastrowid)
+            members = conn.execute(
+                "SELECT user_id FROM community_members WHERE active=1 AND blocked=0 LIMIT ?",
+                (COMMUNITY_MAX_BROADCAST,)
+            ).fetchall()
+            conn.commit()
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"community:report:{live_post_id}")
+        ]])
+        delivered = 0
+        for (recipient_id,) in members:
+            try:
+                sent = await message.bot.send_message(
+                    chat_id=int(recipient_id),
+                    text=f"📰 НОВОСТЬ СООБЩЕСТВА · @{row[1] or 'участник'}\n\n{row[2][:3500]}",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+                with db() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO community_deliveries(post_id,recipient_id,delivered_message_id) VALUES(?,?,?)",
+                        (live_post_id, str(recipient_id), int(sent.message_id))
+                    )
+                    conn.commit()
+                delivered += 1
+            except Exception:
+                logging.exception("Could not deliver approved community news")
+        await message.answer(f"✅ Публикация #{post_id} одобрена и отправлена участникам. Доставлено: {delivered}.")
+    except sqlite3.Error:
+        logging.exception("Could not approve community post")
+        await message.answer("Не удалось одобрить публикацию.")
+
+
+@dp.message(Command("communityreject"))
+async def community_reject_command(message: Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    try:
+        post_id = int((message.text or "").split(maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await message.answer("Использование: /communityreject ID_ПУБЛИКАЦИИ")
+        return
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                "UPDATE community_posts SET status='rejected' WHERE id=? AND status='pending'", (post_id,)
+            )
+            conn.commit()
+        await message.answer("Публикация отклонена." if cur.rowcount else "Публикация не найдена или уже обработана.")
+    except sqlite3.Error:
+        logging.exception("Could not reject community post")
+        await message.answer("Не удалось отклонить публикацию.")
 
 FEEDBACK_LABELS = {
     "like": "Что нравится", "dislike": "Что не нравится",
@@ -1094,7 +1695,19 @@ async def photo_spot_callback(callback: CallbackQuery):
     if not spot:
         await callback.answer("Место не найдено. Открой список заново.", show_alert=True)
         return
-    await callback.message.answer(photo_spot_detail(spot), disable_web_page_preview=True)
+    images = await search_naver_images(f"{spot['name']} {spot['address']}", display=5)
+    image = next((item for item in images if image_looks_relevant(spot["name"], item.get("title", ""))), None)
+    detail = photo_spot_detail(spot)
+    if image:
+        caption = detail + "\n\n📸 Фото из поиска NAVER. Перед поездкой сверь место и условия посещения."
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+        try:
+            await callback.message.answer_photo(photo=image["image_url"], caption=caption, disable_notification=True)
+        except Exception:
+            await callback.message.answer(detail, disable_web_page_preview=True)
+    else:
+        await callback.message.answer(detail, disable_web_page_preview=True)
     await callback.answer()
 
 
@@ -1206,7 +1819,8 @@ async def start(message: Message):
         "Помощник для жизни в Южной Корее.\n"
         "Ищи места, работу, магазины игрушек, аренду авто, медицину, жильё и услуги.\n"
         "Можно искать в конкретном городе или по Корее.\n"
-        "Оценки пользователей объединяются в общий рейтинг.\n\n"
+        "Оценки пользователей объединяются в общий рейтинг.\n"
+        "В сообществе можно общаться и делиться фото/видео.\n\n"
         "Примеры: «нужны недорогие игрушки в Чхонане» или "
         "«ищу работу на складе в Чхонане, зарплата от 3 млн вон».",
         reply_markup=make_keyboard()
@@ -1278,7 +1892,11 @@ async def nav_home_callback(callback: CallbackQuery):
     uid = str(callback.from_user.id)
     USER_FLOWS.pop(uid, None)
     cancel_user_search(uid)
-    await callback.message.answer("🏠 Главное меню TrustMap Korea", reply_markup=make_keyboard())
+    try:
+        await callback.message.edit_text("🏠 Главное меню TrustMap Korea")
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        await callback.message.answer("🏠 Главное меню TrustMap Korea", reply_markup=make_keyboard())
     await callback.answer()
 
 
@@ -1315,22 +1933,101 @@ async def chain_choice_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("community:"))
 async def community_callback(callback: CallbackQuery):
     uid = str(callback.from_user.id)
-    action = (callback.data or "").split(":", 1)[1]
-    if action == "post":
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "join":
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT blocked FROM community_members WHERE user_id=?", (uid,)
+                ).fetchone()
+                if row and row[0]:
+                    await callback.answer("Доступ к сообществу ограничен администратором.", show_alert=True)
+                    return
+                conn.execute(
+                    "INSERT INTO community_members(user_id,username,active) VALUES(?,?,1) "
+                    "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,active=1,last_seen_at=CURRENT_TIMESTAMP",
+                    (uid, callback.from_user.username or None)
+                )
+                conn.commit()
+            USER_FLOWS[uid] = {"kind": "community_chat", "stage": "live", "values": {}}
+            await callback.message.answer(
+                "✅ Ты в сообществе TrustMap Korea. Теперь отправляй сюда текст, фото или видео — "
+                "сообщение увидят другие участники, которые тоже вступили в сообщество. "
+                "Чтобы выйти, нажми «⬅️ Назад в меню» или кнопку «Покинуть чат» в разделе сообщества.",
+                reply_markup=make_keyboard()
+            )
+        except sqlite3.Error:
+            logging.exception("Could not join community")
+            await callback.answer("Не удалось подключиться к сообществу. Попробуй позже.", show_alert=True)
+            return
+    elif action == "leave":
+        USER_FLOWS.pop(uid, None)
+        try:
+            with db() as conn:
+                conn.execute("UPDATE community_members SET active=0,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+                conn.commit()
+        except sqlite3.Error:
+            logging.exception("Could not leave community")
+        await callback.message.answer("Ты вышел из живого чата. Открыть сообщество можно снова через меню.", reply_markup=make_keyboard())
+    elif action == "chat":
+        try:
+            with db() as conn:
+                row = conn.execute("SELECT active,blocked FROM community_members WHERE user_id=?", (uid,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        if not row or not row[0]:
+            await callback.answer("Сначала нажми «Войти в чат».", show_alert=True)
+            return
+        if row[1]:
+            await callback.answer("Доступ к сообществу ограничен администратором.", show_alert=True)
+            return
+        USER_FLOWS[uid] = {"kind": "community_chat", "stage": "live", "values": {}}
+        await callback.message.answer("💬 Чат активен. Отправь текст, фото или видео.", reply_markup=make_keyboard())
+    elif action == "post":
         USER_FLOWS[uid] = {"kind": "community_post", "stage": "message", "values": {}}
         await callback.message.answer(
-            "✍️ Напиши сообщение для сообщества: полезную информацию, новость или личный опыт. "
-            "Не публикуй чужие телефоны, адреса проживания и другие личные данные. "
-            "Публикация попадёт администратору на проверку."
+            "📰 Отправь текст новости или полезного объявления. Эта публикация попадёт на проверку администратору. "
+            "Для общения и обмена фото/видео в реальном времени нажми «Войти в чат»."
+        )
+    elif action == "news":
+        USER_FLOWS[uid] = {"kind": "naver_news_query", "stage": "query", "values": {}}
+        await callback.message.answer(
+            "🔎 Напиши тему новостей, которые ищем через NAVER. Например: «Чхонан», «работа в Корее» или «изменения для иностранцев»."
         )
     elif action == "rules":
         await callback.message.answer(
             "📌 Правила сообщества: уважай участников; указывай город и дату, если это важно; "
-            "отделяй личный опыт от проверенных фактов; не размещай спам, мошеннические предложения "
-            "или чужие личные данные. Публикации пока проходят ручную проверку."
+            "отделяй личный опыт от проверенных фактов; не размещай спам, мошенничество, рекламу без согласия "
+            "и чужие личные данные. Сообщения живого чата видны вступившим участникам сразу. "
+            "На каждом сообщении можно отправить жалобу; администрация может скрывать публикации и ограничивать доступ."
         )
+    elif action == "report" and len(parts) >= 3:
+        try:
+            post_id = int(parts[2])
+            with db() as conn:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO community_reports(post_id,reporter_id) VALUES(?,?)",
+                    (post_id, uid)
+                )
+                conn.commit()
+                report_added = cur.rowcount > 0
+            if report_added and ADMIN_TELEGRAM_ID:
+                try:
+                    await callback.bot.send_message(
+                        int(ADMIN_TELEGRAM_ID),
+                        f"🚩 Жалоба на публикацию сообщества #{post_id}. Отправитель жалобы: Telegram ID {uid}. "
+                        f"Проверь командой /communityreports"
+                    )
+                except Exception:
+                    logging.exception("Could not notify admin about community report")
+            await callback.answer("Жалоба отправлена администратору." if report_added else "Ты уже жаловался на эту публикацию.")
+            return
+        except (ValueError, sqlite3.Error):
+            logging.exception("Could not save community report")
+            await callback.answer("Не удалось отправить жалобу.", show_alert=True)
+            return
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("city:"))
 async def city_callback(callback: CallbackQuery):
@@ -1517,16 +2214,18 @@ async def search_housing_sources(message, query, user_id, values):
         except Exception:
             logging.exception("Housing web search failed")
     # Also return real estate offices from Kakao Local, displayed as a compact list.
-    found, error = await search_kakao(query)
+    found, error = await search_places_combined(query)
     if error:
         await message.answer(error)
         return
     agencies = [p for p in (found or []) if "부동산" in (p.get("category_name", "") + p.get("place_name", ""))]
     if agencies:
         PLACE_RESULTS[str(user_id)] = {}
+        keyboard = place_list_keyboard(user_id, agencies)
+        await send_place_previews(message, user_id, agencies)
         await message.answer(
-            "🏢 Агентства недвижимости из Kakao. Нажми на название, чтобы открыть контакты:",
-            reply_markup=place_list_keyboard(user_id, agencies)
+            "🏢 Агентства недвижимости из Kakao и NAVER. Нажми на название, чтобы открыть контакты:",
+            reply_markup=keyboard
         )
 
 
@@ -1568,6 +2267,29 @@ async def deposit_callback(callback: CallbackQuery):
     await callback.answer("Параметры сохранены")
     await finish_housing_search(callback.message, uid)
 
+
+
+@dp.callback_query(F.data.startswith("comment:"))
+async def place_comment_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    place_id = (callback.data or "").split(":", 1)[1]
+    place = next(
+        (p for p in PLACE_RESULTS.get(uid, {}).values() if str(p.get("id", "")) == place_id),
+        None
+    )
+    if not place:
+        await callback.answer("Список мест устарел. Найди место заново.", show_alert=True)
+        return
+    USER_FLOWS[uid] = {
+        "kind": "place_comment",
+        "stage": "message",
+        "values": {"place_id": place_id, "place_name": place.get("place_name", "Место")}
+    }
+    await callback.message.answer(
+        f"💬 Напиши отзыв о «{place.get('place_name', 'месте')}» (от 3 до 1500 символов). "
+        "Опиши личный опыт без чужих личных данных."
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("rate:"))
 async def rating_callback(callback: CallbackQuery):
@@ -1642,19 +2364,34 @@ def looks_like_ai(text):
 
 @dp.message()
 async def handle_message(message: Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
+    text = (message.text or message.caption or "").strip()
     uid = str(message.from_user.id)
+    if not text and not (message.photo or message.video or message.animation or message.document or message.voice):
+        return
     q = normalize(text)
     cancel_user_search(uid)
 
     if text == "⬅️ Назад в меню":
+        was_community = USER_FLOWS.get(uid, {}).get("kind") == "community_chat"
         USER_FLOWS.pop(uid, None)
+        if was_community:
+            try:
+                with db() as conn:
+                    conn.execute("UPDATE community_members SET active=0,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+                    conn.commit()
+            except sqlite3.Error:
+                logging.exception("Could not deactivate community membership")
         cancel_user_search(uid)
         await message.answer("🏠 Главное меню TrustMap Korea", reply_markup=make_keyboard())
         return
     if text == "🧹 Очистить чат":
+        if USER_FLOWS.get(uid, {}).get("kind") == "community_chat":
+            try:
+                with db() as conn:
+                    conn.execute("UPDATE community_members SET active=0,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+                    conn.commit()
+            except sqlite3.Error:
+                logging.exception("Could not deactivate community membership on chat clear")
         CONVERSATION_HISTORY.pop(uid, None)
         USER_FLOWS.pop(uid, None)
         PLACE_RESULTS.pop(uid, None)
@@ -1667,6 +2404,22 @@ async def handle_message(message: Message):
             reply_markup=make_keyboard()
         )
         return
+    live_flow = USER_FLOWS.get(uid)
+    if live_flow and live_flow.get("kind") == "community_chat":
+        menu_labels = [item for row in CATEGORIES for item in row]
+        if text and text in menu_labels:
+            USER_FLOWS.pop(uid, None)
+            try:
+                with db() as conn:
+                    conn.execute("UPDATE community_members SET active=0,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+                    conn.commit()
+            except sqlite3.Error:
+                logging.exception("Could not deactivate community membership on menu action")
+            # Continue below and process the selected menu item normally.
+        else:
+            await publish_community_message(message, uid)
+            return
+
     if text == "🤖 ИИ-помощник":
         USER_FLOWS.pop(uid, None)
         await message.answer("Напиши любой вопрос обычным сообщением. Для актуальной информации я попробую использовать веб-поиск.")
@@ -1679,6 +2432,34 @@ async def handle_message(message: Message):
         USER_FLOWS[uid] = {"kind": "feedback_select", "stage": "type", "values": {}}
         await message.answer("💬 Помоги сделать TrustMap Korea лучше. Что хочешь сообщить?", reply_markup=feedback_kind_keyboard())
         return
+
+    comment_flow = USER_FLOWS.get(uid)
+    if comment_flow and comment_flow.get("kind") == "place_comment":
+        menu_labels = [item for row in CATEGORIES for item in row]
+        if text not in menu_labels and text not in ("⬅️ Назад в меню", "🧹 Очистить чат"):
+            body = text.strip()
+            if len(body) < 3:
+                await message.answer("Отзыв слишком короткий. Напиши минимум 3 символа.")
+                return
+            if len(body) > 1500:
+                await message.answer("Отзыв слишком длинный. Ограничь его 1500 символами.")
+                return
+            values = comment_flow.get("values", {})
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "INSERT INTO place_comments(place_id,place_name,user_id,username,comment) VALUES(?,?,?,?,?)",
+                        (values.get("place_id", ""), values.get("place_name", "Место"), uid,
+                         message.from_user.username or None, body)
+                    )
+                    conn.commit()
+                USER_FLOWS.pop(uid, None)
+                await message.answer("💙 Спасибо! Письменный отзыв сохранён и появится в карточке места.", reply_markup=make_keyboard())
+            except sqlite3.Error:
+                logging.exception("Could not save place comment")
+                await message.answer("Не удалось сохранить отзыв. Попробуй позже.")
+            return
+        USER_FLOWS.pop(uid, None)
 
     flow_now = USER_FLOWS.get(uid)
     if flow_now and flow_now.get("kind") == "feedback" and flow_now.get("stage") == "message":
@@ -1717,6 +2498,30 @@ async def handle_message(message: Message):
                 logging.exception("Could not notify bot owner about feedback")
         return
 
+    # Search fresh news through NAVER API HUB when requested from the community menu.
+    news_flow = USER_FLOWS.get(uid)
+    if news_flow and news_flow.get("kind") == "naver_news_query" and text:
+        USER_FLOWS.pop(uid, None)
+        await message.answer("📰 Ищу новости в NAVER…")
+        news_items = await search_naver_news(text, display=5)
+        if not news_items:
+            await message.answer(
+                "Не удалось получить новости NAVER по этому запросу. Проверь, включён ли API «뉴스» в NAVER API HUB, "
+                "и попробуй другую формулировку.",
+                reply_markup=make_keyboard()
+            )
+            return
+        chunks = [f"📰 Новости NAVER по запросу: {text}\n"]
+        for idx, item in enumerate(news_items[:5], 1):
+            title = _clean_naver_html(item.get("title")) or "Заголовок не указан"
+            desc = _clean_naver_html(item.get("description")) or "Описание не указано"
+            link = item.get("link") or item.get("originallink") or ""
+            published = item.get("pubDate") or "Дата не указана"
+            chunks.append(f"{idx}. {title}\n{desc}\n🕒 {published}\n🔗 {link}")
+        await send_long(message, "\n\n".join(chunks))
+        await message.answer("Проверяй дату и оригинальную публикацию перед тем, как делиться новостью.", reply_markup=make_keyboard())
+        return
+
     # Community submissions are saved for moderation; they are not broadcast automatically.
     flow = USER_FLOWS.get(uid)
     if flow and flow.get("kind") == "community_post" and flow.get("stage") == "message":
@@ -1742,8 +2547,8 @@ async def handle_message(message: Message):
                 try:
                     await message.bot.send_message(
                         int(ADMIN_TELEGRAM_ID),
-                        f"💬 ПУБЛИКАЦИЯ СООБЩЕСТВА НА ПРОВЕРКУ #{post_id}\\n"
-                        f"От: @{username or 'без username'} (ID {uid})\\n\\n{text[:3500]}"
+                        f"💬 ПУБЛИКАЦИЯ СООБЩЕСТВА НА ПРОВЕРКУ #{post_id}\n"
+                        f"От: @{username or 'без username'} (ID {uid})\n\n{text[:3500]}"
                     )
                 except Exception:
                     logging.exception("Could not notify admin about community post")
@@ -1832,6 +2637,13 @@ async def handle_message(message: Message):
             return
 
     if text in [item for row in CATEGORIES for item in row]:
+        if USER_FLOWS.get(uid, {}).get("kind") == "community_chat":
+            try:
+                with db() as conn:
+                    conn.execute("UPDATE community_members SET active=0,last_seen_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+                    conn.commit()
+            except sqlite3.Error:
+                logging.exception("Could not deactivate community membership on category switch")
         USER_FLOWS.pop(uid, None)
         if text == "📸 Места для фото":
             await message.answer(photo_spots_text(), reply_markup=photo_spots_keyboard(), disable_web_page_preview=True)
@@ -1859,15 +2671,17 @@ async def handle_message(message: Message):
             await message.answer("👘 В каком городе искать аренду ханбока?", reply_markup=city_keyboard())
             return
         if text == "💬 Сообщество":
+            try:
+                with db() as conn:
+                    member = conn.execute("SELECT active,blocked FROM community_members WHERE user_id=?", (uid,)).fetchone()
+                active = bool(member and member[0] and not member[1])
+            except sqlite3.Error:
+                active = False
             await message.answer(
-                "💬 Сообщество TrustMap Korea\\n\\n"
-                "Здесь можно предложить полезную новость или личный опыт. Сейчас публикации отправляются "
-                "администратору на проверку; автоматической общей ленты и чата участников пока нет.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="➕ Предложить публикацию", callback_data="community:post")],
-                    [InlineKeyboardButton(text="📌 Правила", callback_data="community:rules")],
-                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:home")],
-                ])
+                "💬 Сообщество TrustMap Korea\n\n"
+                "Общий чат для участников: сообщения, фото и видео передаются вступившим пользователям в реальном времени. "
+                "Новости и объявления можно отдельно отправлять на проверку. Под сообщениями есть кнопка жалобы.",
+                reply_markup=community_menu_keyboard(active)
             )
             return
         if text == "🏠 Недвижимость":
@@ -1928,6 +2742,7 @@ async def handle_message(message: Message):
         await message.answer("⏳ Обрабатывается запрос…")
         result = await ask_jobs_ai(text, message.from_user.id)
         await send_long(message, result + job_search_links(text))
+        await send_naver_job_sources(message, translate_query(text) + " 채용 구인")
         await message.answer(
             "ℹ️ Перед откликом проверь оригинальное объявление. Не плати за обещание гарантированного трудоустройства или визы.",
             reply_markup=make_keyboard()
