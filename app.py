@@ -84,6 +84,8 @@ PHOTO_SPOTS = {
 CATEGORIES = [
     ["🔎 Поиск мест", "🏥 Медицина"],
     ["🍽️ Кафе и рестораны", "🛍️ Магазины"],
+    ["🏪 Сети магазинов", "💊 Круглосуточные аптеки"],
+    ["👘 Ханбок и традиционная одежда", "💬 Сообщество"],
     ["🚗 Авто и запчасти", "🚙 Аренда машины"],
     ["🏠 Недвижимость", "💼 Работа"],
     ["💄 Красота и уход", "👶 Товары для детей"],
@@ -93,7 +95,7 @@ CATEGORIES = [
     ["💰 Сравнение цен", "🧖 Бани и сауны"],
     ["🎮 Компьютерные клубы", "🤖 ИИ-помощник"],
     ["🌐 Язык / Language", "💬 Отзыв о боте"],
-    ["🧹 Очистить чат"],
+    ["⬅️ Назад в меню", "🧹 Очистить чат"],
 ]
 
 CITIES = {
@@ -222,6 +224,10 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS bot_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
             language_code TEXT, feedback_type TEXT NOT NULL, message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS community_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
+            message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS user_job_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT,
@@ -1248,6 +1254,84 @@ async def budget_callback(callback: CallbackQuery):
     await callback.answer("Предпочтение сохранено")
 
 
+def food_choice_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="☕ Только кафе", callback_data="food:cafe"),
+         InlineKeyboardButton(text="🍽️ Только рестораны", callback_data="food:restaurant")],
+        [InlineKeyboardButton(text="🔎 Кафе и рестораны", callback_data="food:both")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:home")],
+    ])
+
+
+def chain_choice_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="emart", callback_data="chain:emart"),
+         InlineKeyboardButton(text="GS25", callback_data="chain:gs25")],
+        [InlineKeyboardButton(text="CU", callback_data="chain:cu"),
+         InlineKeyboardButton(text="7-Eleven", callback_data="chain:seven")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:home")],
+    ])
+
+
+@dp.callback_query(F.data == "nav:home")
+async def nav_home_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    USER_FLOWS.pop(uid, None)
+    cancel_user_search(uid)
+    await callback.message.answer("🏠 Главное меню TrustMap Korea", reply_markup=make_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("food:"))
+async def food_choice_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
+    query = {"cafe": "카페", "restaurant": "음식점", "both": "카페 음식점"}.get(choice)
+    if not query:
+        await callback.answer("Не удалось определить выбор.", show_alert=True)
+        return
+    USER_FLOWS[uid] = {"kind": "special_search", "stage": "city", "values": {"query": query, "notice": "food"}}
+    await callback.message.answer("📍 Выбери город или поиск по всей Корее:", reply_markup=city_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("chain:"))
+async def chain_choice_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    choice = (callback.data or "").split(":", 1)[1]
+    queries = {
+        "emart": "이마트", "gs25": "GS25 편의점",
+        "cu": "CU 편의점", "seven": "세븐일레븐 편의점",
+    }
+    query = queries.get(choice)
+    if not query:
+        await callback.answer("Не удалось определить сеть.", show_alert=True)
+        return
+    USER_FLOWS[uid] = {"kind": "special_search", "stage": "city", "values": {"query": query, "notice": "chain"}}
+    await callback.message.answer("📍 В каком городе искать магазины этой сети?", reply_markup=city_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("community:"))
+async def community_callback(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    action = (callback.data or "").split(":", 1)[1]
+    if action == "post":
+        USER_FLOWS[uid] = {"kind": "community_post", "stage": "message", "values": {}}
+        await callback.message.answer(
+            "✍️ Напиши сообщение для сообщества: полезную информацию, новость или личный опыт. "
+            "Не публикуй чужие телефоны, адреса проживания и другие личные данные. "
+            "Публикация попадёт администратору на проверку."
+        )
+    elif action == "rules":
+        await callback.message.answer(
+            "📌 Правила сообщества: уважай участников; указывай город и дату, если это важно; "
+            "отделяй личный опыт от проверенных фактов; не размещай спам, мошеннические предложения "
+            "или чужие личные данные. Публикации пока проходят ручную проверку."
+        )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("city:"))
 async def city_callback(callback: CallbackQuery):
     user_id = str(callback.from_user.id)
@@ -1565,6 +1649,11 @@ async def handle_message(message: Message):
     q = normalize(text)
     cancel_user_search(uid)
 
+    if text == "⬅️ Назад в меню":
+        USER_FLOWS.pop(uid, None)
+        cancel_user_search(uid)
+        await message.answer("🏠 Главное меню TrustMap Korea", reply_markup=make_keyboard())
+        return
     if text == "🧹 Очистить чат":
         CONVERSATION_HISTORY.pop(uid, None)
         USER_FLOWS.pop(uid, None)
@@ -1626,6 +1715,42 @@ async def handle_message(message: Message):
                 )
             except Exception:
                 logging.exception("Could not notify bot owner about feedback")
+        return
+
+    # Community submissions are saved for moderation; they are not broadcast automatically.
+    flow = USER_FLOWS.get(uid)
+    if flow and flow.get("kind") == "community_post" and flow.get("stage") == "message":
+        if len(text.strip()) < 5:
+            await message.answer("Добавь немного больше информации (минимум 5 символов).")
+            return
+        username = message.from_user.username or None
+        try:
+            with db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO community_posts(user_id,username,message) VALUES(?,?,?)",
+                    (uid, username, text[:5000])
+                )
+                post_id = cur.lastrowid
+                conn.commit()
+            USER_FLOWS.pop(uid, None)
+            await message.answer(
+                "✅ Публикация отправлена на проверку. Она не появится у других пользователей, "
+                "пока администратор её не проверит.",
+                reply_markup=make_keyboard()
+            )
+            if ADMIN_TELEGRAM_ID:
+                try:
+                    await message.bot.send_message(
+                        int(ADMIN_TELEGRAM_ID),
+                        f"💬 ПУБЛИКАЦИЯ СООБЩЕСТВА НА ПРОВЕРКУ #{post_id}\\n"
+                        f"От: @{username or 'без username'} (ID {uid})\\n\\n{text[:3500]}"
+                    )
+                except Exception:
+                    logging.exception("Could not notify admin about community post")
+        except sqlite3.Error:
+            logging.exception("Could not save community post")
+            USER_FLOWS.pop(uid, None)
+            await message.answer("Не удалось сохранить публикацию. Попробуй позже.", reply_markup=make_keyboard())
         return
 
     # Accept user-submitted job ads for moderation before publication.
@@ -1710,6 +1835,40 @@ async def handle_message(message: Message):
         USER_FLOWS.pop(uid, None)
         if text == "📸 Места для фото":
             await message.answer(photo_spots_text(), reply_markup=photo_spots_keyboard(), disable_web_page_preview=True)
+            return
+        if text == "🍽️ Кафе и рестораны":
+            await message.answer("Что ищем?", reply_markup=food_choice_keyboard())
+            return
+        if text == "🏪 Сети магазинов":
+            await message.answer("Выбери сеть магазинов:", reply_markup=chain_choice_keyboard())
+            return
+        if text == "💊 Круглосуточные аптеки":
+            USER_FLOWS[uid] = {"kind": "special_search", "stage": "city", "values": {
+                "query": "24시간 약국", "notice": "pharmacy24"
+            }}
+            await message.answer(
+                "💊 Выбери город. Важно: Kakao может находить аптеки по запросу «24시간 약국», "
+                "но не всегда подтверждает актуальные часы работы. Проверяй часы по телефону перед поездкой.",
+                reply_markup=city_keyboard()
+            )
+            return
+        if text == "👘 Ханбок и традиционная одежда":
+            USER_FLOWS[uid] = {"kind": "special_search", "stage": "city", "values": {
+                "query": "한복 대여", "notice": "hanbok"
+            }}
+            await message.answer("👘 В каком городе искать аренду ханбока?", reply_markup=city_keyboard())
+            return
+        if text == "💬 Сообщество":
+            await message.answer(
+                "💬 Сообщество TrustMap Korea\\n\\n"
+                "Здесь можно предложить полезную новость или личный опыт. Сейчас публикации отправляются "
+                "администратору на проверку; автоматической общей ленты и чата участников пока нет.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Предложить публикацию", callback_data="community:post")],
+                    [InlineKeyboardButton(text="📌 Правила", callback_data="community:rules")],
+                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:home")],
+                ])
+            )
             return
         if text == "🏠 Недвижимость":
             USER_FLOWS[uid] = {"kind": "housing", "stage": "type", "values": {}}
